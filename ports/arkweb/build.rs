@@ -15,6 +15,7 @@ fn main() {
         "cpp/servo_nweb.cpp",
         "cpp/servo_handler_proxy.cpp",
         "cpp/servo_stub_managers.cpp",
+        "cpp/servo_native_window.cpp",
     ];
 
     cxx_build::bridge("src/bridge.rs")

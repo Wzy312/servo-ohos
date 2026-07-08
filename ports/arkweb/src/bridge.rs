@@ -81,6 +81,13 @@ pub mod ffi_arkweb {
         fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool;
         fn init_logging(min_level: i32);
     }
+
+    unsafe extern "C++" {
+        include!("servo_native_window.h");
+
+        /// Set the OHNativeWindow buffer geometry before surfman creates/resizes its EGL surface.
+        fn set_native_window_buffer_geometry(window: usize, width: u32, height: u32);
+    }
 }
 
 // ---- `extern "Rust"` implementations (resolved by cxx as `super::<name>`). ----

@@ -1,0 +1,159 @@
+diff --git a/arkweb_utils/arkweb_utils.cpp b/arkweb_utils/arkweb_utils.cpp
+index dcda11e2c..0fa2abc83 100644
+--- a/arkweb_utils/arkweb_utils.cpp
++++ b/arkweb_utils/arkweb_utils.cpp
+@@ -476,6 +476,8 @@ ArkWebEngineVersionMetrics MapToMetricsVersion(ArkWebEngineVersion version)
+             return ArkWebEngineVersionMetrics::M132;
+         case ArkWebEngineVersion::M144:
+             return ArkWebEngineVersionMetrics::M144;
++        case ArkWebEngineVersion::SERVO:
++            return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
+     }
+     WVLOG_W("Unexpected ArkWebEngineVersion: %{public}d", static_cast<int32_t>(version));
+     return ArkWebEngineVersionMetrics::UNKNOWN_METRICS;
+@@ -508,7 +510,8 @@ ArkWebEngineVersion CalculateActiveWebEngineVersion()
+ {
+     int webEngineEnforce = OHOS::system::GetIntParameter("web.engine.enforce", 0);
+     if (webEngineEnforce == static_cast<int>(ArkWebEngineType::EVERGREEN) ||
+-        webEngineEnforce == static_cast<int>(ArkWebEngineType::LEGACY)) {
++        webEngineEnforce == static_cast<int>(ArkWebEngineType::LEGACY) ||
++        webEngineEnforce == static_cast<int>(ArkWebEngineType::SERVO)) {
+         WVLOG_I("CalculateActiveWebEngineVersion, enforce %{public}d", webEngineEnforce);
+         return static_cast<ArkWebEngineVersion>(webEngineEnforce);
+     }
+@@ -550,6 +553,11 @@ bool IsActiveWebEngineEvergreen()
+     return false;
+ }
+ 
++bool IsActiveWebEngineServo()
++{
++    return getActiveWebEngineType() == ArkWebEngineType::SERVO;
++}
++
+ void LogForUnsupportedFunc(ArkWebEngineVersion version, const char* msg)
+ {
+     WVLOG_W("%{public}s unsupported engine version: %{public}d",
+diff --git a/arkweb_utils/arkweb_utils.h b/arkweb_utils/arkweb_utils.h
+index b04016097..bc53eb4a2 100644
+--- a/arkweb_utils/arkweb_utils.h
++++ b/arkweb_utils/arkweb_utils.h
+@@ -89,6 +89,7 @@ enum class ArkWebEngineVersion {
+     M114 = 1,
+     M132 = 2,
+     M144 = 3,
++    SERVO = 100,
+     PLAYGROUND = 99998,
+     SYSTEM_EVERGREEN = 99999
+ };
+@@ -96,6 +97,7 @@ enum class ArkWebEngineVersion {
+ enum class ArkWebEngineType {
+     LEGACY = static_cast<int>(ArkWebEngineVersion::M132),
+     EVERGREEN = static_cast<int>(ArkWebEngineVersion::M144),
++    SERVO = static_cast<int>(ArkWebEngineVersion::SERVO),
+     PLAYGROUND = static_cast<int>(ArkWebEngineVersion::PLAYGROUND),
+ };
+ 
+@@ -127,6 +129,7 @@ ARKWEB_EXPORT void SetAppVersionInner(const std::string& appVersion);
+ ARKWEB_EXPORT std::string ExtractAndRemoveParam(std::string& renderCmd, const std::string& prefix);
+ ARKWEB_EXPORT void UpdateAppInfoFromCmdline(std::string& renderCmd);
+ ARKWEB_EXPORT bool IsActiveWebEngineEvergreen();
++ARKWEB_EXPORT bool IsActiveWebEngineServo();
+ ARKWEB_EXPORT void SelectWebcoreBeforeProcessRun(const std::string& appBundleName);
+ 
+ ARKWEB_EXPORT std::string GetArkwebLibPath();
+diff --git a/ohos_nweb/src/nweb_helper.cpp b/ohos_nweb/src/nweb_helper.cpp
+index 21180fecf..40c9c550e 100644
+--- a/ohos_nweb/src/nweb_helper.cpp
++++ b/ohos_nweb/src/nweb_helper.cpp
+@@ -16,6 +16,7 @@
+ #include "nweb_helper.h"
+ 
+ #include <cstdint>
++#include <dlfcn.h>
+ #include <refbase.h>
+ #include <surface.h>
+ #include <thread>
+@@ -706,12 +707,83 @@ bool NWebHelper::RegisterCustomSchemes()
+     return true;
+ }
+ 
++namespace {
++constexpr int SERVO_ARKWEB_EXPECTED_ABI_VERSION = 1;
++constexpr char SERVO_ARKWEB_DEFAULT_LIB[] = "/system/lib64/libservo_arkweb.so";
++
++using ServoAbiVersionFn = int (*)();
++using ServoCreateEngineFn = OHOS::NWeb::NWebEngine* (*)();
++
++// dlopen the Servo shim and hand back its NWebEngine, or nullptr on any failure (with a logged
++// reason). On success the library handle is intentionally leaked: the engine is a process-wide
++// singleton that lives for the lifetime of the process, so the shim must never be unloaded.
++OHOS::NWeb::NWebEngine* LoadServoWebEngine()
++{
++    std::string libPath = OHOS::system::GetParameter("web.engine.servo.path", SERVO_ARKWEB_DEFAULT_LIB);
++
++    dlerror();
++    void* handle = dlopen(libPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
++    if (handle == nullptr) {
++        WVLOG_E("servo: dlopen('%{public}s') failed: %{public}s", libPath.c_str(), dlerror());
++        return nullptr;
++    }
++
++    dlerror();
++    auto abiVersionFn = reinterpret_cast<ServoAbiVersionFn>(dlsym(handle, "servo_arkweb_abi_version"));
++    if (abiVersionFn == nullptr) {
++        WVLOG_E("servo: symbol 'servo_arkweb_abi_version' not found: %{public}s", dlerror());
++        dlclose(handle);
++        return nullptr;
++    }
++
++    int abiVersion = abiVersionFn();
++    if (abiVersion != SERVO_ARKWEB_EXPECTED_ABI_VERSION) {
++        WVLOG_E("servo: ABI version mismatch, shim reports %{public}d, host expects %{public}d",
++            abiVersion, SERVO_ARKWEB_EXPECTED_ABI_VERSION);
++        dlclose(handle);
++        return nullptr;
++    }
++
++    dlerror();
++    auto createEngineFn =
++        reinterpret_cast<ServoCreateEngineFn>(dlsym(handle, "servo_arkweb_create_nweb_engine"));
++    if (createEngineFn == nullptr) {
++        WVLOG_E("servo: symbol 'servo_arkweb_create_nweb_engine' not found: %{public}s", dlerror());
++        dlclose(handle);
++        return nullptr;
++    }
++
++    OHOS::NWeb::NWebEngine* engine = createEngineFn();
++    if (engine == nullptr) {
++        WVLOG_E("servo: factory 'servo_arkweb_create_nweb_engine' returned nullptr");
++        dlclose(handle);
++        return nullptr;
++    }
++
++    WVLOG_I("servo: loaded web engine from %{public}s (abi %{public}d)", libPath.c_str(), abiVersion);
++    return engine;
++}
++}  // namespace
++
+ bool NWebHelper::GetWebEngine(bool fromArk)
+ {
+     if (nwebEngine_) {
+         return true;
+     }
+ 
++    if (OHOS::ArkWeb::IsActiveWebEngineServo()) {
++        NWebEngine* servoEngine = LoadServoWebEngine();
++        if (servoEngine == nullptr) {
++            WVLOG_E("failed to load servo web engine");
++            return false;
++        }
++        // No-op deleter: LoadServoWebEngine hands back a leaked process singleton.
++        nwebEngine_ = std::shared_ptr<NWebEngine>(servoEngine, [](NWebEngine*) {});
++        nwebEngine_->LibraryLoaded(GetInitArgs(), lazyInitializeWebEngine_);
++        WVLOG_I("servo web engine loaded");
++        return true;
++    }
++
+     if (bundlePath_.empty()) {
+         auto ctx = AbilityRuntime::ApplicationContext::GetApplicationContext();
+         if (!ctx) {
