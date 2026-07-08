@@ -1,0 +1,161 @@
+//! The cxx bridge between the C++ NWeb shim and the Rust libservo glue.
+//!
+//! Two modules, mirroring the intended future diplomat-generated C++ embedder API:
+//!   * `servo::embedder` — embedder-generic surface (draft spec for diplomat later).
+//!   * `servo::arkweb`   — ArkWeb/OHOS-specific extras.
+//!
+//! The `extern "Rust"` functions are the C++ -> Rust entry points; their bodies live below
+//! and simply delegate to [`crate::runtime`]. The `WebViewClient` opaque C++ type is the
+//! engine -> embedder callback sink (implemented by `NWebHandlerProxy` on the C++ side).
+
+use cxx::{CxxString, SharedPtr};
+
+use crate::bridge::ffi::WebViewClient;
+
+#[cxx::bridge(namespace = "servo::embedder")]
+pub mod ffi {
+    /// Options parsed from the ArkWeb engine init args, passed once at engine startup.
+    struct InitOptions {
+        user_data_dir: String,
+        lang: String,
+        extra_args: Vec<String>,
+    }
+
+    extern "Rust" {
+        fn initialize(options: InitOptions) -> bool;
+        fn shutdown();
+        fn create_webview(
+            window_handle: usize,
+            width: u32,
+            height: u32,
+            client: SharedPtr<WebViewClient>,
+        ) -> u32;
+        fn destroy_webview(id: u32);
+        fn load_url(id: u32, url: &CxxString);
+        fn reload(id: u32);
+        fn go_back(id: u32);
+        fn go_forward(id: u32);
+        fn resize(id: u32, width: u32, height: u32);
+        fn set_throttled(id: u32, throttled: bool);
+        fn focus(id: u32);
+        fn blur(id: u32);
+        fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32);
+        fn scroll_by(id: u32, dx: f32, dy: f32);
+        fn set_page_zoom(id: u32, zoom: f32);
+        fn evaluate_javascript(id: u32, code: &CxxString);
+        fn get_url(id: u32) -> String;
+        fn get_title(id: u32) -> String;
+        fn get_progress(id: u32) -> i32;
+        fn can_go_back(id: u32) -> bool;
+        fn can_go_forward(id: u32) -> bool;
+    }
+
+    unsafe extern "C++" {
+        include!("servo_client.h");
+
+        /// Abstract engine -> embedder callback sink. `NWebHandlerProxy` subclasses it and
+        /// forwards to the ACE-provided `NWebHandler`. Methods take `&self` (const in C++)
+        /// because invoking a callback does not mutate the sink itself.
+        type WebViewClient;
+        fn on_load_started(self: &WebViewClient, url: &CxxString);
+        fn on_load_finished(self: &WebViewClient, url: &CxxString, http_status: i32);
+        fn on_load_error(self: &WebViewClient, code: i32, desc: &CxxString, url: &CxxString);
+        fn on_url_changed(self: &WebViewClient, url: &CxxString);
+        fn on_title_changed(self: &WebViewClient, title: &CxxString);
+        fn on_progress(self: &WebViewClient, progress: i32);
+        fn on_history_changed(self: &WebViewClient, can_back: bool, can_fwd: bool);
+        fn on_console_message(
+            self: &WebViewClient,
+            level: i32,
+            msg: &CxxString,
+            line: i32,
+            source: &CxxString,
+        );
+        fn on_frame_ready(self: &WebViewClient);
+    }
+}
+
+#[cxx::bridge(namespace = "servo::arkweb")]
+pub mod ffi_arkweb {
+    extern "Rust" {
+        fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool;
+        fn init_logging(min_level: i32);
+    }
+}
+
+// ---- `extern "Rust"` implementations (resolved by cxx as `super::<name>`). ----
+
+fn initialize(options: ffi::InitOptions) -> bool {
+    crate::runtime::initialize(options)
+}
+fn shutdown() {
+    crate::runtime::shutdown()
+}
+fn create_webview(
+    window_handle: usize,
+    width: u32,
+    height: u32,
+    client: SharedPtr<WebViewClient>,
+) -> u32 {
+    crate::runtime::create_webview(window_handle, width, height, client)
+}
+fn destroy_webview(id: u32) {
+    crate::runtime::destroy_webview(id)
+}
+fn load_url(id: u32, url: &CxxString) {
+    crate::runtime::load_url(id, url)
+}
+fn reload(id: u32) {
+    crate::runtime::reload(id)
+}
+fn go_back(id: u32) {
+    crate::runtime::go_back(id)
+}
+fn go_forward(id: u32) {
+    crate::runtime::go_forward(id)
+}
+fn resize(id: u32, width: u32, height: u32) {
+    crate::runtime::resize(id, width, height)
+}
+fn set_throttled(id: u32, throttled: bool) {
+    crate::runtime::set_throttled(id, throttled)
+}
+fn focus(id: u32) {
+    crate::runtime::focus(id)
+}
+fn blur(id: u32) {
+    crate::runtime::blur(id)
+}
+fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
+    crate::runtime::touch_event(id, kind, x, y, pointer_id)
+}
+fn scroll_by(id: u32, dx: f32, dy: f32) {
+    crate::runtime::scroll_by(id, dx, dy)
+}
+fn set_page_zoom(id: u32, zoom: f32) {
+    crate::runtime::set_page_zoom(id, zoom)
+}
+fn evaluate_javascript(id: u32, code: &CxxString) {
+    crate::runtime::evaluate_javascript(id, code)
+}
+fn get_url(id: u32) -> String {
+    crate::runtime::get_url(id)
+}
+fn get_title(id: u32) -> String {
+    crate::runtime::get_title(id)
+}
+fn get_progress(id: u32) -> i32 {
+    crate::runtime::get_progress(id)
+}
+fn can_go_back(id: u32) -> bool {
+    crate::runtime::can_go_back(id)
+}
+fn can_go_forward(id: u32) -> bool {
+    crate::runtime::can_go_forward(id)
+}
+fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool {
+    crate::runtime::send_key_event(id, oh_keycode, oh_action)
+}
+fn init_logging(min_level: i32) {
+    crate::runtime::init_logging(min_level)
+}
