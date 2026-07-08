@@ -78,7 +78,7 @@ pub mod ffi {
 #[cxx::bridge(namespace = "servo::arkweb")]
 pub mod ffi_arkweb {
     extern "Rust" {
-        fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool;
+        fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool;
         fn init_logging(min_level: i32);
     }
 
@@ -87,6 +87,10 @@ pub mod ffi_arkweb {
 
         /// Set the OHNativeWindow buffer geometry before surfman creates/resizes its EGL surface.
         fn set_native_window_buffer_geometry(window: usize, width: u32, height: u32);
+
+        /// Release an OHNativeWindow from CreateNativeWindowFromSurface (call after the rendering
+        /// context using it is dropped).
+        fn destroy_native_window(window: usize);
     }
 }
 
@@ -160,8 +164,8 @@ fn can_go_back(id: u32) -> bool {
 fn can_go_forward(id: u32) -> bool {
     crate::runtime::can_go_forward(id)
 }
-fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool {
-    crate::runtime::send_key_event(id, oh_keycode, oh_action)
+fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
+    crate::runtime::key_event(id, keycode, action, unicode)
 }
 fn init_logging(min_level: i32) {
     crate::runtime::init_logging(min_level)

@@ -11,4 +11,8 @@ namespace servo::arkweb {
 // is created (and on resize) or WebRender renders into degenerate buffers and reports OutOfMemory.
 void set_native_window_buffer_geometry(std::size_t window, std::uint32_t width, std::uint32_t height);
 
+// Release an OHNativeWindow obtained from CreateNativeWindowFromSurface. Call once, after the
+// surfman rendering context using it has been dropped (i.e. after destroy_webview returns).
+void destroy_native_window(std::size_t window);
+
 }  // namespace servo::arkweb

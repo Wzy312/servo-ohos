@@ -82,6 +82,10 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
     auto nweb = std::make_shared<ServoNWeb>(id, proxy);
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // Prune entries whose web component has been destroyed.
+        for (auto it = nwebs_.begin(); it != nwebs_.end();) {
+            it = it->second.expired() ? nwebs_.erase(it) : std::next(it);
+        }
         nwebs_[id] = nweb;
     }
     return nweb;
@@ -90,7 +94,7 @@ std::shared_ptr<NWeb> ServoNWebEngine::CreateNWeb(std::shared_ptr<NWebCreateInfo
 std::shared_ptr<NWeb> ServoNWebEngine::GetNWeb(int32_t nweb_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = nwebs_.find(static_cast<uint32_t>(nweb_id));
-    return it == nwebs_.end() ? nullptr : it->second;
+    return it == nwebs_.end() ? nullptr : it->second.lock();
 }
 
 // The Servo thread is started here rather than only in InitializeWebEngine: the OHOS lifecycle
