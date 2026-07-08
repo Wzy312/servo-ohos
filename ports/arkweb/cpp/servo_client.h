@@ -1,0 +1,34 @@
+#ifndef SERVO_ARKWEB_SERVO_CLIENT_H
+#define SERVO_ARKWEB_SERVO_CLIENT_H
+
+#include <cstdint>
+#include <string>
+
+namespace servo::embedder {
+
+// Abstract engine -> embedder callback sink, invoked from the servo side through the cxx
+// bridge (declared there as an opaque `WebViewClient`). `NWebHandlerProxy` implements it by
+// forwarding to the ACE-provided OHOS::NWeb::NWebHandler.
+//
+// Methods are const: invoking a callback does not mutate the sink itself (the mutable inner
+// handler pointer is guarded separately). This matches the cxx `self: &WebViewClient` binding.
+class WebViewClient {
+public:
+    virtual ~WebViewClient() = default;
+
+    virtual void on_load_started(const std::string& url) const = 0;
+    virtual void on_load_finished(const std::string& url, std::int32_t http_status) const = 0;
+    virtual void on_load_error(std::int32_t code, const std::string& desc,
+                               const std::string& url) const = 0;
+    virtual void on_url_changed(const std::string& url) const = 0;
+    virtual void on_title_changed(const std::string& title) const = 0;
+    virtual void on_progress(std::int32_t progress) const = 0;
+    virtual void on_history_changed(bool can_back, bool can_fwd) const = 0;
+    virtual void on_console_message(std::int32_t level, const std::string& msg, std::int32_t line,
+                                    const std::string& source) const = 0;
+    virtual void on_frame_ready() const = 0;
+};
+
+}  // namespace servo::embedder
+
+#endif  // SERVO_ARKWEB_SERVO_CLIENT_H

@@ -1,0 +1,35 @@
+[package]
+name = "arkweb"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+repository.workspace = true
+description = "Servo as an alternative ArkWeb (OpenHarmony) webview backend."
+
+[lib]
+name = "servo_arkweb"
+crate-type = ["cdylib"]
+
+# All runtime dependencies are gated on the OpenHarmony target environment. On any
+# other target (e.g. host `./mach check`) this crate compiles to an empty library.
+# Note: freetype is bundled (compiled from source) by default on ohos; there is no
+# `bundled_freetype` servo feature. `dynamic_freetype` would opt into dynamic linking.
+[target.'cfg(target_env = "ohos")'.dependencies]
+servo = { workspace = true, default-features = false, features = ["js_jit"] }
+cxx = { workspace = true }
+dpi = { workspace = true }
+hilog = { workspace = true }
+# force inprocess: ohos is single-process for now, mirroring servoshell.
+ipc-channel = { workspace = true, features = ["force-inprocess"] }
+log = { workspace = true }
+ohos-vsync = { workspace = true }
+raw-window-handle = { workspace = true }
+# aws-lc-rs: the crypto provider Servo's rustls-based networking needs installed for TLS.
+rustls = { workspace = true, features = ["aws-lc-rs"] }
+url = { workspace = true }
+
+[build-dependencies]
+cxx-build = { workspace = true }

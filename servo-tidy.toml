@@ -54,6 +54,9 @@ directories = [
     "./tests/wpt/meta/.cache",
     "./tests/wpt/mozilla/meta/.cache",
     "./tests/wpt/webgl/meta/.cache",
+    # The ArkWeb port is Apache-2.0 licensed (declared in ports/arkweb/Cargo.toml), not MPL, and
+    # vendors NWeb headers verbatim from OpenHarmony (vendor/ohos_nweb/OHOS_SYNC_INFO.md).
+    "./ports/arkweb",
 ]
 
 # Directories that are checked for correct file extension
