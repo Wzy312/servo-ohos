@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 
+use cookie::Cookie;
 use cxx::{CxxString, SharedPtr};
 use dpi::PhysicalSize;
 use log::{LevelFilter, error, info};
@@ -28,9 +29,9 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    ConsoleLogLevel, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState,
-    KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder,
-    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key,
+    KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo,
+    ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
     WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
@@ -112,6 +113,19 @@ enum Action {
         id: u32,
         key: Key,
         state: KeyState,
+    },
+    GetCookie {
+        url: String,
+        include_http_only: bool,
+        ack: Sender<String>,
+    },
+    SetCookie {
+        url: String,
+        value: String,
+        ack: Sender<bool>,
+    },
+    ClearCookies {
+        ack: Sender<()>,
     },
 }
 
@@ -379,6 +393,57 @@ impl ServoThread {
                     state, key,
                 )));
             }),
+            Action::GetCookie {
+                url,
+                include_http_only,
+                ack,
+            } => {
+                // ArkWeb's `fetchCookieSync` expects a `name=value; name2=value2` string. The
+                // non-HTTP source excludes HttpOnly cookies (as `document.cookie` does).
+                let source = if include_http_only {
+                    CookieSource::HTTP
+                } else {
+                    CookieSource::NonHTTP
+                };
+                let cookies = match Url::parse(&url) {
+                    Ok(url) => self.servo.site_data_manager().cookies_for_url(url, source),
+                    Err(error) => {
+                        error!("[arkweb] get_cookie: invalid url {url:?}: {error}");
+                        Vec::new()
+                    },
+                };
+                let joined = cookies
+                    .iter()
+                    .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let _ = ack.send(joined);
+            },
+            Action::SetCookie { url, value, ack } => {
+                let ok = match (Url::parse(&url), Cookie::parse(value.clone())) {
+                    (Ok(url), Ok(cookie)) => {
+                        self.servo.site_data_manager().set_cookie_for_url(
+                            url,
+                            cookie.into_owned(),
+                            None,
+                        );
+                        true
+                    },
+                    (Err(error), _) => {
+                        error!("[arkweb] set_cookie: invalid url {url:?}: {error}");
+                        false
+                    },
+                    (_, Err(error)) => {
+                        error!("[arkweb] set_cookie: invalid cookie {value:?}: {error}");
+                        false
+                    },
+                };
+                let _ = ack.send(ok);
+            },
+            Action::ClearCookies { ack } => {
+                self.servo.site_data_manager().clear_cookies(None);
+                let _ = ack.send(());
+            },
         }
     }
 
@@ -832,5 +897,46 @@ pub fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
         };
         send(Action::Key { id, key, state });
         true
+    })
+}
+
+pub fn cookie_get(url: &CxxString, include_http_only: bool) -> String {
+    guard("cookie_get", || {
+        let Some(tx) = SERVO_CHANNEL.get() else {
+            return String::new();
+        };
+        let (ack, ack_rx) = mpsc::channel();
+        let _ = tx.send(Action::GetCookie {
+            url: url.to_string_lossy().into_owned(),
+            include_http_only,
+            ack,
+        });
+        ack_rx.recv().unwrap_or_default()
+    })
+}
+
+pub fn cookie_set(url: &CxxString, value: &CxxString) -> bool {
+    guard("cookie_set", || {
+        let Some(tx) = SERVO_CHANNEL.get() else {
+            return false;
+        };
+        let (ack, ack_rx) = mpsc::channel();
+        let _ = tx.send(Action::SetCookie {
+            url: url.to_string_lossy().into_owned(),
+            value: value.to_string_lossy().into_owned(),
+            ack,
+        });
+        ack_rx.recv().unwrap_or(false)
+    })
+}
+
+pub fn cookie_clear() {
+    guard("cookie_clear", || {
+        let Some(tx) = SERVO_CHANNEL.get() else {
+            return;
+        };
+        let (ack, ack_rx) = mpsc::channel();
+        let _ = tx.send(Action::ClearCookies { ack });
+        let _ = ack_rx.recv();
     })
 }
