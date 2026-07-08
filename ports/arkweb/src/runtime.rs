@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
@@ -27,8 +28,8 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    EventLoopWaker, LoadStatus, RenderingContext, Servo, ServoBuilder, WebView, WebViewBuilder,
-    WebViewDelegate, WindowRenderingContext,
+    EventLoopWaker, LoadStatus, Opts, RenderingContext, Servo, ServoBuilder, WebView,
+    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -145,9 +146,27 @@ impl EventLoopWaker for ArkWaker {
     }
 }
 
-struct WebViewEntry {
+/// The Servo `WebView`, built lazily once a real size is known. The rendering context is held by
+/// the painter and the delegate (which paints through it), so it is not kept here separately.
+struct BuiltWebView {
     webview: WebView,
-    rendering_context: Rc<WindowRenderingContext>,
+}
+
+struct WebViewEntry {
+    window_handle: usize,
+    client: SharedPtr<WebViewClient>,
+    sync: Arc<SyncState>,
+    /// The most recent size ACE reported. ACE creates the NWeb at a 1x1 placeholder before layout
+    /// and issues one real `Resize` afterwards; surfman must create its EGL surface at the real
+    /// size (creating at 1x1 then resizing the producer surface makes WebRender OOM), so the
+    /// WebView is not built until this is non-degenerate — mirroring how servoshell only creates a
+    /// WebView once a real window size is available.
+    size: PhysicalSize<u32>,
+    /// A URL requested before the WebView existed / its browsing context was registered. Held here
+    /// and flushed by [`ServoThread::flush_pending_loads`] once the WebView is built and ready.
+    pending_url: Option<Url>,
+    /// `None` until the first real-sized `Resize` builds the WebView.
+    built: Option<BuiltWebView>,
 }
 
 struct ServoThread {
@@ -156,7 +175,7 @@ struct ServoThread {
 }
 
 impl ServoThread {
-    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>) {
+    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf) {
         // Install the crypto provider Servo's rustls-based networking requires for TLS.
         if rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -165,7 +184,16 @@ impl ServoThread {
             info!("[arkweb] rustls crypto provider already installed");
         }
         let waker = Box::new(ArkWaker { chan: waker_chan });
-        let servo = ServoBuilder::default().event_loop_waker(waker).build();
+        // `config_dir` must be set: the OHOS font cache unwraps `opts::get().config_dir`
+        // (fonts/platform/freetype/ohos/font_cache.rs) when Servo initializes.
+        let opts = Opts {
+            config_dir: Some(config_dir),
+            ..Default::default()
+        };
+        let servo = ServoBuilder::default()
+            .opts(opts)
+            .event_loop_waker(waker)
+            .build();
         let mut thread = ServoThread {
             servo,
             webviews: HashMap::new(),
@@ -173,6 +201,7 @@ impl ServoThread {
         while let Ok(action) = rx.recv() {
             thread.handle(action);
             thread.servo.spin_event_loop();
+            thread.flush_pending_loads();
         }
         info!("[arkweb] servo-main thread exiting");
     }
@@ -197,10 +226,14 @@ impl ServoThread {
                 SYNC_STATES.lock().unwrap().remove(&id);
                 let _ = ack.send(());
             },
-            Action::LoadUrl { id, url } => {
-                if let (Some(entry), Ok(url)) = (self.webviews.get(&id), Url::parse(&url)) {
-                    entry.webview.load(url);
-                }
+            Action::LoadUrl { id, url } => match Url::parse(&url) {
+                Ok(url) => {
+                    if let Some(entry) = self.webviews.get_mut(&id) {
+                        // Defer the actual load until the WebView is registered (see below).
+                        entry.pending_url = Some(url);
+                    }
+                },
+                Err(error) => error!("[arkweb] load_url id={id}: invalid url {url:?}: {error}"),
             },
             Action::Reload(id) => self.with_webview(id, |wv| wv.reload()),
             Action::GoBack(id) => self.with_webview(id, |wv| {
@@ -210,10 +243,37 @@ impl ServoThread {
                 wv.go_forward(1);
             }),
             Action::Resize { id, width, height } => {
-                if let Some(entry) = self.webviews.get(&id) {
-                    let size = PhysicalSize::new(width.max(1), height.max(1));
-                    entry.rendering_context.resize(size);
-                    entry.webview.resize(size);
+                info!("[arkweb] resize id={id} {width}x{height}");
+                let size = PhysicalSize::new(width.max(1), height.max(1));
+                let already_built = match self.webviews.get_mut(&id) {
+                    Some(entry) => {
+                        entry.size = size;
+                        match &entry.built {
+                            Some(built) => {
+                                crate::bridge::ffi_arkweb::set_native_window_buffer_geometry(
+                                    entry.window_handle,
+                                    size.width,
+                                    size.height,
+                                );
+                                // `WebView::resize` resizes the shared rendering context itself (via
+                                // the painter) *and* issues the WebRender document-view + display-list
+                                // update that schedules the repaint. Do not resize the context
+                                // directly first: the painter early-returns when the context is
+                                // already at the target size, which skips that repaint and leaves the
+                                // stale frame until the next unrelated event (e.g. a tap) — most
+                                // visibly a half-height page after the soft keyboard closes. Buffer
+                                // geometry is still set above, before the surfman resize `resize()`
+                                // performs.
+                                built.webview.resize(size);
+                                true
+                            },
+                            None => false,
+                        }
+                    },
+                    None => true,
+                };
+                if !already_built {
+                    self.ensure_built(id);
                 }
             },
             Action::SetThrottled { id, throttled } => {
@@ -229,9 +289,95 @@ impl ServoThread {
     }
 
     fn with_webview(&self, id: u32, f: impl FnOnce(&WebView)) {
-        if let Some(entry) = self.webviews.get(&id) {
-            f(&entry.webview);
+        if let Some(built) = self
+            .webviews
+            .get(&id)
+            .and_then(|entry| entry.built.as_ref())
+        {
+            f(&built.webview);
         }
+    }
+
+    /// Load any URL that was requested before its WebView existed or its browsing context was
+    /// registered. A WebView is ready once the constellation has registered it, observable as
+    /// `url()` becoming `Some`. Retried after every event-loop turn, so the constellation's own
+    /// wakeups drive it.
+    fn flush_pending_loads(&mut self) {
+        for entry in self.webviews.values_mut() {
+            let ready = entry
+                .built
+                .as_ref()
+                .is_some_and(|built| built.webview.url().is_some());
+            if ready && entry.pending_url.is_some() {
+                let url = entry.pending_url.take().expect("checked is_some");
+                info!("[arkweb] flushing pending load: {url}");
+                if let Some(built) = &entry.built {
+                    built.webview.load(url);
+                }
+            }
+        }
+    }
+
+    /// Build the WebView + surfman rendering context once a real (non-1x1) size is known. No-op if
+    /// already built or still at the 1x1 placeholder. See [`WebViewEntry::size`].
+    fn ensure_built(&mut self, id: u32) {
+        let (window_handle, size, client, sync) = match self.webviews.get(&id) {
+            Some(entry)
+                if entry.built.is_none() && entry.size.width > 1 && entry.size.height > 1 =>
+            {
+                (
+                    entry.window_handle,
+                    entry.size,
+                    entry.client.clone(),
+                    entry.sync.clone(),
+                )
+            },
+            _ => return,
+        };
+
+        let Some(native_window) = NonNull::new(window_handle as *mut c_void) else {
+            error!("[arkweb] build webview id={id}: null OHNativeWindow");
+            return;
+        };
+        let raw_window = RawWindowHandle::OhosNdk(OhosNdkWindowHandle::new(native_window));
+        let raw_display = RawDisplayHandle::Ohos(OhosDisplayHandle::new());
+        // SAFETY: the OHNativeWindow / display remain valid until the destroy rendezvous.
+        let window = unsafe { WindowHandle::borrow_raw(raw_window) };
+        let display = unsafe { DisplayHandle::borrow_raw(raw_display) };
+
+        // surfman does not set the native window's buffer geometry; ACE's producer surface has
+        // none, so set it before creating the EGL surface or WebRender OOMs on the mismatch.
+        crate::bridge::ffi_arkweb::set_native_window_buffer_geometry(
+            window_handle,
+            size.width,
+            size.height,
+        );
+        let rendering_context = match WindowRenderingContext::new(display, window, size) {
+            Ok(context) => Rc::new(context),
+            Err(error) => {
+                error!("[arkweb] build webview id={id}: rendering context: {error:?}");
+                return;
+            },
+        };
+
+        let delegate = Rc::new(ArkWebViewDelegate {
+            sync,
+            client,
+            rendering_context: rendering_context.clone(),
+        });
+        let webview = WebViewBuilder::new(&self.servo, rendering_context.clone())
+            .delegate(delegate)
+            .build();
+        webview.focus();
+        webview.show();
+
+        if let Some(entry) = self.webviews.get_mut(&id) {
+            entry.built = Some(BuiltWebView { webview });
+        }
+        info!(
+            "[arkweb] built webview id={id} at {}x{}",
+            size.width, size.height
+        );
     }
 
     fn create_webview(
@@ -243,44 +389,26 @@ impl ServoThread {
         client: SendClient,
         sync: Arc<SyncState>,
     ) {
-        let Some(native_window) = NonNull::new(window_handle as *mut c_void) else {
-            error!("[arkweb] create_webview id={id}: null OHNativeWindow");
-            return;
-        };
-        let raw_window = RawWindowHandle::OhosNdk(OhosNdkWindowHandle::new(native_window));
-        let raw_display = RawDisplayHandle::Ohos(OhosDisplayHandle::new());
-        // SAFETY: the OHNativeWindow / display remain valid until the destroy rendezvous.
-        let window = unsafe { WindowHandle::borrow_raw(raw_window) };
-        let display = unsafe { DisplayHandle::borrow_raw(raw_display) };
-
+        // Register the WebView's parameters but defer building it: ACE creates the NWeb at a 1x1
+        // placeholder before layout, and surfman must create its EGL surface at the real size.
+        // The build happens in `ensure_built` on the first non-degenerate `Resize`.
         let size = PhysicalSize::new(width.max(1), height.max(1));
-        let rendering_context = match WindowRenderingContext::new(display, window, size) {
-            Ok(context) => Rc::new(context),
-            Err(error) => {
-                error!("[arkweb] create_webview id={id}: rendering context: {error:?}");
-                return;
-            },
-        };
-
-        let delegate = Rc::new(ArkWebViewDelegate {
-            sync,
-            client: client.0,
-            rendering_context: rendering_context.clone(),
-        });
-        let webview = WebViewBuilder::new(&self.servo, rendering_context.clone())
-            .delegate(delegate)
-            .build();
-        webview.focus();
-        webview.show();
-
         self.webviews.insert(
             id,
             WebViewEntry {
-                webview,
-                rendering_context,
+                window_handle,
+                client: client.0,
+                sync,
+                size,
+                pending_url: None,
+                built: None,
             },
         );
-        info!("[arkweb] create_webview id={id} window={window_handle:#x} {width}x{height}");
+        info!(
+            "[arkweb] register webview id={id} window={window_handle:#x} {width}x{height} (build deferred)"
+        );
+        // Build immediately if ACE already gave a real size (otherwise wait for the first Resize).
+        self.ensure_built(id);
     }
 }
 
@@ -334,6 +462,13 @@ impl WebViewDelegate for ArkWebViewDelegate {
     }
 
     fn notify_new_frame_ready(&self, webview: WebView) {
+        // ACE creates the NWeb at a 1x1 placeholder and resizes to the real size once laid out.
+        // Presenting into a 1x1 surface makes WebRender report OutOfMemory every frame and panic
+        // after five, so skip painting until a real size has arrived.
+        let size = self.rendering_context.size();
+        if size.width <= 1 || size.height <= 1 {
+            return;
+        }
         if self.rendering_context.make_current().is_ok() {
             webview.paint();
             self.rendering_context.present();
@@ -370,6 +505,18 @@ pub fn initialize(options: InitOptions) -> bool {
             options.user_data_dir, options.lang, options.extra_args
         );
 
+        // Servo needs a writable `config_dir` (used for the OHOS font cache and prefs). The OHOS
+        // side passes the app's data dir as `--user-data-dir`; fall back to the sandbox-relative
+        // app cache dir if it is absent.
+        let config_dir = if options.user_data_dir.is_empty() {
+            PathBuf::from("/data/storage/el2/base/cache/servo")
+        } else {
+            PathBuf::from(&options.user_data_dir).join("servo")
+        };
+        if let Err(error) = std::fs::create_dir_all(&config_dir) {
+            error!("[arkweb] failed to create config dir {config_dir:?}: {error}");
+        }
+
         if SERVO_CHANNEL.get().is_some() {
             info!("[arkweb] already initialized");
             return true;
@@ -378,7 +525,7 @@ pub fn initialize(options: InitOptions) -> bool {
         let waker_chan = tx.clone();
         match thread::Builder::new()
             .name("servo-main".into())
-            .spawn(move || ServoThread::run(rx, waker_chan))
+            .spawn(move || ServoThread::run(rx, waker_chan, config_dir))
         {
             Ok(_) => {
                 // Publish the channel only once the draining thread is alive. On a spawn failure the
