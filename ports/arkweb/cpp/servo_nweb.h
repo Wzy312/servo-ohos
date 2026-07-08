@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "generated/servo_nweb_stub_base.h"
 #include "servo_handler_proxy.h"
@@ -26,8 +27,11 @@ public:
     void OnTouchPress(int32_t id, double x, double y, bool fromOverlay) override;
     void OnTouchRelease(int32_t id, double x, double y, bool fromOverlay) override;
     void OnTouchMove(int32_t id, double x, double y, bool fromOverlay) override;
+    void OnTouchMove(const std::vector<std::shared_ptr<NWebTouchPointInfo>>& touch_point_infos,
+                     bool fromOverlay) override;
     void OnTouchCancel() override;
     bool SendKeyEvent(int32_t keyCode, int32_t keyAction) override;
+    bool SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyboardEvent) override;
     int Load(const std::string& url) override;
     bool IsNavigatebackwardAllowed() override;
     bool IsNavigateForwardAllowed() override;

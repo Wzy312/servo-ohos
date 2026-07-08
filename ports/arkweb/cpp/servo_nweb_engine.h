@@ -30,7 +30,10 @@ public:
 
 private:
     std::mutex mutex_;
-    std::unordered_map<uint32_t, std::shared_ptr<NWeb>> nwebs_;
+    // Weak, so a destroyed web component's NWeb (and the ACE handler its proxy pins) is released
+    // once ACE drops its shared_ptr, rather than leaked here on every open/close. GetNWeb locks it;
+    // expired entries are pruned on the next CreateNWeb.
+    std::unordered_map<uint32_t, std::weak_ptr<NWeb>> nwebs_;
 };
 
 }  // namespace OHOS::NWeb

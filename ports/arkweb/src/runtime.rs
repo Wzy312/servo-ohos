@@ -6,7 +6,7 @@
 //! ArkTS side reads synchronously (`getUrl()`, `accessBackward()`, ...) are cached in a shared
 //! [`SyncState`] that the [`ArkWebViewDelegate`] updates on the servo thread.
 //!
-//! Not yet wired (tracked as `TODO(arkweb)`): input injection (touch/key/scroll — M2) and the
+//! Touch, scroll and key input are translated into servo `InputEvent`s here. Not yet wired: the
 //! OHOS vsync refresh driver (this uses the default timer-based driver for now).
 
 use std::collections::HashMap;
@@ -28,8 +28,10 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    EventLoopWaker, LoadStatus, Opts, RenderingContext, Servo, ServoBuilder, WebView,
-    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
+    LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
+    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
 use url::Url;
 
@@ -85,6 +87,18 @@ enum Action {
         id: u32,
         throttled: bool,
     },
+    Touch {
+        id: u32,
+        kind: u8,
+        x: f32,
+        y: f32,
+        pointer_id: i32,
+    },
+    Scroll {
+        id: u32,
+        dx: f32,
+        dy: f32,
+    },
     Focus(u32),
     SetPageZoom {
         id: u32,
@@ -94,6 +108,38 @@ enum Action {
         id: u32,
         code: String,
     },
+    Key {
+        id: u32,
+        key: Key,
+        state: KeyState,
+    },
+}
+
+/// Map an OHOS (ArkUI/MMI) key code plus its unicode value to a servo [`Key`]. Named keys are
+/// matched first; any other key with a printable unicode value becomes a `Character`.
+fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
+    let named = match keycode {
+        2054 | 2119 => NamedKey::Enter, // KEY_ENTER / KEY_NUMPAD_ENTER
+        2055 => NamedKey::Backspace,    // KEY_DEL (deletes backwards)
+        2071 => NamedKey::Delete,       // KEY_FORWARD_DEL
+        2049 => NamedKey::Tab,          // KEY_TAB
+        2070 => NamedKey::Escape,       // KEY_ESCAPE
+        2012 => NamedKey::ArrowUp,      // KEY_DPAD_UP
+        2013 => NamedKey::ArrowDown,    // KEY_DPAD_DOWN
+        2014 => NamedKey::ArrowLeft,    // KEY_DPAD_LEFT
+        2015 => NamedKey::ArrowRight,   // KEY_DPAD_RIGHT
+        2081 => NamedKey::Home,         // KEY_MOVE_HOME
+        2082 => NamedKey::End,          // KEY_MOVE_END
+        _ => {
+            return u32::try_from(unicode)
+                .ok()
+                .filter(|&u| u != 0)
+                .and_then(char::from_u32)
+                .filter(|c| !c.is_control())
+                .map(|c| Key::Character(c.to_string()));
+        },
+    };
+    Some(Key::Named(named))
 }
 
 static SERVO_CHANNEL: OnceLock<Sender<Action>> = OnceLock::new();
@@ -222,7 +268,14 @@ impl ServoThread {
                 let _ = ack.send(());
             },
             Action::DestroyWebView { id, ack } => {
-                self.webviews.remove(&id);
+                if let Some(entry) = self.webviews.remove(&id) {
+                    // Drop the WebView + rendering context first (releases the EGL surface bound to
+                    // the native window), then release the native window obtained from
+                    // CreateNativeWindowFromSurface, which is otherwise leaked on every close.
+                    let window_handle = entry.window_handle;
+                    drop(entry);
+                    crate::bridge::ffi_arkweb::destroy_native_window(window_handle);
+                }
                 SYNC_STATES.lock().unwrap().remove(&id);
                 let _ = ack.send(());
             },
@@ -271,12 +324,61 @@ impl ServoThread {
             Action::SetThrottled { id, throttled } => {
                 self.with_webview(id, |wv| wv.set_throttled(throttled))
             },
+            Action::Touch {
+                id,
+                kind,
+                x,
+                y,
+                pointer_id,
+            } => {
+                let event_type = match kind {
+                    0 => TouchEventType::Down,
+                    1 => TouchEventType::Move,
+                    2 => TouchEventType::Up,
+                    _ => TouchEventType::Cancel,
+                };
+                self.with_webview(id, |wv| {
+                    wv.notify_input_event(InputEvent::Touch(TouchEvent::new(
+                        event_type,
+                        TouchId(pointer_id),
+                        DevicePoint::new(x, y).into(),
+                        TouchPointerType::Touch,
+                    )));
+                });
+            },
+            Action::Scroll { id, dx, dy } => {
+                // ACE's ScrollBy/ScrollTo carry no anchor; scroll about the viewport centre.
+                // Touch-drag scrolling does not use this path — Servo derives it from the touch
+                // event sequence itself.
+                if let Some(entry) = self.webviews.get(&id) {
+                    if let Some(built) = entry.built.as_ref() {
+                        let point = DevicePoint::new(
+                            entry.size.width as f32 / 2.0,
+                            entry.size.height as f32 / 2.0,
+                        )
+                        .into();
+                        built.webview.notify_scroll_event(
+                            Scroll::Delta(DeviceVector2D::new(dx, dy).into()),
+                            point,
+                        );
+                    }
+                }
+            },
             Action::Focus(id) => self.with_webview(id, |wv| wv.focus()),
             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
-            Action::EvaluateJavaScript { id, code } => {
-                // TODO(arkweb): WebView JS evaluation + result callback (M3).
-                let _ = (id, code);
-            },
+            Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
+                // Fire-and-forget for M2; the result callback is surfaced to ACE in M3.
+                wv.evaluate_javascript(code, |result| {
+                    if let Err(error) = result {
+                        error!("[arkweb] evaluate_javascript failed: {error:?}");
+                    }
+                });
+            }),
+            Action::Key { id, key, state } => self.with_webview(id, |wv| {
+                wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+                    state, key,
+                )));
+            }),
         }
     }
 
@@ -619,17 +721,19 @@ pub fn blur(id: u32) {
 }
 
 pub fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
-    // TODO(arkweb): translate to servo InputEvent/TouchEvent (M2).
     guard("touch_event", || {
-        info!("[arkweb] touch id={id} kind={kind} ({x},{y}) pointer={pointer_id}")
+        send(Action::Touch {
+            id,
+            kind,
+            x,
+            y,
+            pointer_id,
+        })
     })
 }
 
 pub fn scroll_by(id: u32, dx: f32, dy: f32) {
-    // TODO(arkweb): translate to a servo scroll/wheel InputEvent (M2).
-    guard("scroll_by", || {
-        info!("[arkweb] scroll_by id={id} ({dx},{dy})")
-    })
+    guard("scroll_by", || send(Action::Scroll { id, dx, dy }))
 }
 
 pub fn set_page_zoom(id: u32, zoom: f32) {
@@ -675,10 +779,20 @@ pub fn can_go_forward(id: u32) -> bool {
     })
 }
 
-pub fn send_key_event(id: u32, oh_keycode: i32, oh_action: i32) -> bool {
-    // TODO(arkweb): translate to a servo KeyboardEvent (M2).
-    guard("send_key_event", || {
-        info!("[arkweb] key id={id} code={oh_keycode} action={oh_action}");
-        false
+/// Translate an OHOS key event into a servo `KeyboardEvent`. `action`: 0 = down, 1 = up (ArkUI
+/// `KeyAction`). `unicode` is the character value if any (0 otherwise). Returns whether the key was
+/// mapped and dispatched, so ACE can fall back to its own handling for keys we do not consume.
+pub fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
+    guard("key_event", || {
+        let state = match action {
+            0 => KeyState::Down,
+            1 => KeyState::Up,
+            _ => return false,
+        };
+        let Some(key) = oh_key_to_servo_key(keycode, unicode) else {
+            return false;
+        };
+        send(Action::Key { id, key, state });
+        true
     })
 }

@@ -54,12 +54,34 @@ void ServoNWeb::OnTouchMove(int32_t id, double x, double y, bool /*fromOverlay*/
     servo::embedder::touch_event(id_, kTouchMove, static_cast<float>(x), static_cast<float>(y), id);
 }
 
+// ACE forwards touch-move during a pan through this batched overload (web_delegate.cpp
+// HandleTouchMove), not the single-point one, so it must be overridden or drags are dropped.
+void ServoNWeb::OnTouchMove(const std::vector<std::shared_ptr<NWebTouchPointInfo>>& touch_point_infos,
+                            bool /*fromOverlay*/) {
+    for (const auto& point : touch_point_infos) {
+        if (point) {
+            servo::embedder::touch_event(id_, kTouchMove, static_cast<float>(point->GetX()),
+                                         static_cast<float>(point->GetY()), point->GetId());
+        }
+    }
+}
+
 void ServoNWeb::OnTouchCancel() {
     servo::embedder::touch_event(id_, kTouchCancel, 0.0F, 0.0F, -1);
 }
 
 bool ServoNWeb::SendKeyEvent(int32_t keyCode, int32_t keyAction) {
-    return servo::arkweb::send_key_event(id_, keyCode, keyAction);
+    return servo::arkweb::key_event(id_, keyCode, keyAction, 0);
+}
+
+// ACE routes physical key input through here (web_pattern.cpp WebOnKeyEvent), not SendKeyEvent.
+// NWebKeyboardEvent additionally carries the resolved unicode value, used for text characters.
+bool ServoNWeb::SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyboardEvent) {
+    if (!keyboardEvent) {
+        return false;
+    }
+    return servo::arkweb::key_event(id_, keyboardEvent->GetKeyCode(), keyboardEvent->GetAction(),
+                                    keyboardEvent->GetUnicode());
 }
 
 int ServoNWeb::Load(const std::string& url) {
