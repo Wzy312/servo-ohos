@@ -19,6 +19,7 @@ crate-type = ["cdylib"]
 # `bundled_freetype` servo feature. `dynamic_freetype` would opt into dynamic linking.
 [target.'cfg(target_env = "ohos")'.dependencies]
 servo = { workspace = true, default-features = false, features = ["js_jit"] }
+cookie = { workspace = true }
 cxx = { workspace = true }
 dpi = { workspace = true }
 hilog = { workspace = true }

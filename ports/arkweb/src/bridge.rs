@@ -48,6 +48,11 @@ pub mod ffi {
         fn get_progress(id: u32) -> i32;
         fn can_go_back(id: u32) -> bool;
         fn can_go_forward(id: u32) -> bool;
+
+        // Engine-global cookie access, backed by Servo's site-data manager (sync rendezvous).
+        fn cookie_get(url: &CxxString, include_http_only: bool) -> String;
+        fn cookie_set(url: &CxxString, value: &CxxString) -> bool;
+        fn cookie_clear();
     }
 
     unsafe extern "C++" {
@@ -163,6 +168,15 @@ fn can_go_back(id: u32) -> bool {
 }
 fn can_go_forward(id: u32) -> bool {
     crate::runtime::can_go_forward(id)
+}
+fn cookie_get(url: &CxxString, include_http_only: bool) -> String {
+    crate::runtime::cookie_get(url, include_http_only)
+}
+fn cookie_set(url: &CxxString, value: &CxxString) -> bool {
+    crate::runtime::cookie_set(url, value)
+}
+fn cookie_clear() {
+    crate::runtime::cookie_clear()
 }
 fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
     crate::runtime::key_event(id, keycode, action, unicode)
