@@ -28,10 +28,10 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent,
-    LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
-    WindowRenderingContext,
+    ConsoleLogLevel, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key, KeyState,
+    KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo, ServoBuilder,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+    WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -536,15 +536,53 @@ impl WebViewDelegate for ArkWebViewDelegate {
     }
 
     fn notify_load_status_changed(&self, webview: WebView, status: LoadStatus) {
+        // Servo reports load status as three discrete stages, not a percentage; approximate the
+        // 0-100 progress ArkWeb's OnLoadingProgress expects from those stages so the ArkTS
+        // onProgressChange handler (and any progress bar) advances.
+        let progress = match status {
+            LoadStatus::Started => 10,
+            LoadStatus::HeadParsed => 60,
+            LoadStatus::Complete => 100,
+        };
+        self.sync.progress.store(progress, Ordering::Relaxed);
         let Some(client) = self.client.as_ref() else {
             return;
         };
+        client.on_progress(progress);
         let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
         cxx::let_cxx_string!(url = &url);
         match status {
             LoadStatus::Started => client.on_load_started(&url),
             LoadStatus::Complete => client.on_load_finished(&url, 200),
             LoadStatus::HeadParsed => {},
+        }
+    }
+
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        // Map to NWebConsoleLog::NWebConsoleLogLevel { DEBUG=1, INFO, WARNING, ERROR, UNKNOWN }.
+        let nweb_level = match level {
+            ConsoleLogLevel::Debug | ConsoleLogLevel::Trace | ConsoleLogLevel::Dir => 1,
+            ConsoleLogLevel::Log | ConsoleLogLevel::Info => 2,
+            ConsoleLogLevel::Warn => 3,
+            ConsoleLogLevel::Error => 4,
+        };
+        // Servo does not surface the source location with the message; ACE tolerates empty/0.
+        cxx::let_cxx_string!(msg = &message);
+        cxx::let_cxx_string!(source = "");
+        client.on_console_message(nweb_level, &msg, 0, &source);
+    }
+
+    fn notify_crashed(&self, webview: WebView, reason: String, _backtrace: Option<String>) {
+        // Servo has no per-load network-error callback; a webview/renderer crash is the one failure
+        // it does surface, so report it to ACE's page-load-error handler.
+        if let Some(client) = self.client.as_ref() {
+            let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
+            cxx::let_cxx_string!(desc = &reason);
+            cxx::let_cxx_string!(url = &url);
+            client.on_load_error(-1, &desc, &url);
         }
     }
 
