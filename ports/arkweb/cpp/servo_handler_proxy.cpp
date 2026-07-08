@@ -2,7 +2,28 @@
 
 #include <utility>
 
+#include "ohos_nweb/nweb_console_log.h"
+
 namespace servo::arkweb {
+
+namespace {
+// Concrete NWebConsoleLog carrying a servo console message across to OnConsoleLog. Servo provides
+// only the level and text; the line number and source id are unknown (0 / empty).
+class ServoConsoleLog : public OHOS::NWeb::NWebConsoleLog {
+public:
+    ServoConsoleLog(std::string message, NWebConsoleLogLevel level)
+        : message_(std::move(message)), level_(level) {}
+
+    int LineNumer() override { return 0; }
+    std::string Log() override { return message_; }
+    NWebConsoleLogLevel LogLevel() override { return level_; }
+    std::string SourceId() override { return {}; }
+
+private:
+    std::string message_;
+    NWebConsoleLogLevel level_;
+};
+}  // namespace
 
 void NWebHandlerProxy::set_handler(std::shared_ptr<OHOS::NWeb::NWebHandler> handler) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -50,9 +71,14 @@ void NWebHandlerProxy::on_progress(std::int32_t progress) const {
 
 void NWebHandlerProxy::on_history_changed(bool /*can_back*/, bool /*can_fwd*/) const {}
 
-// Forwarding requires constructing an NWebConsoleLog; deferred to the handler-breadth milestone.
-void NWebHandlerProxy::on_console_message(std::int32_t /*level*/, const std::string& /*msg*/,
-                                          std::int32_t /*line*/, const std::string& /*source*/) const {}
+void NWebHandlerProxy::on_console_message(std::int32_t level, const std::string& msg,
+                                          std::int32_t /*line*/, const std::string& /*source*/) const {
+    if (auto h = handler()) {
+        auto log = std::make_shared<ServoConsoleLog>(
+            msg, static_cast<OHOS::NWeb::NWebConsoleLog::NWebConsoleLogLevel>(level));
+        h->OnConsoleLog(std::move(log));
+    }
+}
 
 // Presentation is driven directly on the servo side (EGL swap); nothing to forward.
 void NWebHandlerProxy::on_frame_ready() const {}
