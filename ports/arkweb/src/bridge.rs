@@ -82,6 +82,10 @@ pub mod ffi {
             source: &CxxString,
         );
         fn on_frame_ready(self: &WebViewClient);
+        /// Tell ACE an editable is focused (`true, true`) or blurred (`false, false`) so its back
+        /// button closes the soft keyboard and it tracks the focus text field. The keyboard itself
+        /// is driven by the engine's own IME connection, not by this.
+        fn update_text_field_status(self: &WebViewClient, show_keyboard: bool, attach_ime: bool);
     }
 }
 

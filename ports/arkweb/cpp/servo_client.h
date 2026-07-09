@@ -27,6 +27,9 @@ public:
     virtual void on_console_message(std::int32_t level, const std::string& msg, std::int32_t line,
                                     const std::string& source) const = 0;
     virtual void on_frame_ready() const = 0;
+    // Notifies ACE that an editable is focused / blurred so it tracks the focus text field and its
+    // back button closes the soft keyboard (the keyboard itself is driven by the engine's own IME).
+    virtual void update_text_field_status(bool show_keyboard, bool attach_ime) const = 0;
 };
 
 }  // namespace servo::embedder

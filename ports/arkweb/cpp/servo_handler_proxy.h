@@ -28,6 +28,7 @@ public:
     void on_console_message(std::int32_t level, const std::string& msg, std::int32_t line,
                             const std::string& source) const override;
     void on_frame_ready() const override;
+    void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
 
 private:
     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;
