@@ -22,6 +22,7 @@ xDevice, or the on-device @ohos/hypium module, once that tooling is validated he
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import shlex
@@ -100,6 +101,40 @@ def launch_page(device: HarmonyDevice, url: str | None = None, page: str | None 
     if url:
         command += f" -U {shlex.quote(url)}"
     sh(device, command, check=False)
+
+
+def dump_layout(device: HarmonyDevice, dest_dir: Path) -> dict:
+    """Dump the ArkUI component tree via `uitest dumpLayout` and return it parsed.
+
+    Lets tests find the on-screen bounds of ArkUI components (e.g. an AlertDialog's buttons)
+    instead of hard-coding coordinates. Note: Servo's web content is a GPU surface and is NOT
+    in this tree -- only the `Web` container node is -- so web elements still need page-layout
+    coordinates.
+    """
+    out = sh(device, "uitest dumpLayout", check=False)
+    match = re.search(r"(/data/local/tmp/layout_\d+\.json)", out)
+    assert match, f"could not find layout path in: {out!r}"
+    local = Path(dest_dir) / os.path.basename(match.group(1))
+    device.recv_file(match.group(1), str(local))
+    return json.loads(local.read_text())
+
+
+def find_center(tree: dict, text: str) -> tuple[int, int] | None:
+    """Return the screen centre of the first component whose `text` attribute equals `text`."""
+    found: list[tuple[int, int]] = []
+
+    def walk(node: dict) -> None:
+        attributes = node.get("attributes", node)
+        if attributes.get("text") == text:
+            bounds = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", attributes.get("bounds", ""))
+            if bounds:
+                left, top, right, bottom = (int(v) for v in bounds.groups())
+                found.append(((left + right) // 2, (top + bottom) // 2))
+        for child in node.get("children", []):
+            walk(child)
+
+    walk(tree)
+    return found[0] if found else None
 
 
 def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
@@ -189,6 +224,12 @@ def device() -> HarmonyDevice:
 def cap(device: HarmonyDevice, tmp_path: Path):
     """Return a zero-arg function that captures the screen and returns a PIL image."""
     return lambda: screencap(device, tmp_path)
+
+
+@pytest.fixture
+def dump(device: HarmonyDevice, tmp_path: Path):
+    """Return a zero-arg function that dumps and returns the parsed ArkUI component tree."""
+    return lambda: dump_layout(device, tmp_path)
 
 
 @pytest.fixture
