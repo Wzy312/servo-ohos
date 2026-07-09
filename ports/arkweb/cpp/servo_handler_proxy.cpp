@@ -7,6 +7,7 @@
 #include "arkweb/src/bridge.rs.h"
 #include "ohos_nweb/nweb_console_log.h"
 #include "ohos_nweb/nweb_js_dialog_result.h"
+#include "ohos_nweb/nweb_select_popup_menu.h"
 
 namespace servo::arkweb {
 
@@ -107,6 +108,103 @@ void NWebHandlerProxy::update_text_field_status(bool show_keyboard, bool attach_
     if (auto h = handler()) {
         h->UpdateTextFieldStatus(show_keyboard, attach_ime);
     }
+}
+
+namespace {
+using namespace OHOS::NWeb;
+
+class ServoSelectMenuBound : public NWebSelectMenuBound {
+public:
+    ServoSelectMenuBound(int x, int y, int width, int height)
+        : x_(x), y_(y), width_(width), height_(height) {}
+    int GetX() override { return x_; }
+    int GetY() override { return y_; }
+    int GetWidth() override { return width_; }
+    int GetHeight() override { return height_; }
+
+private:
+    int x_, y_, width_, height_;
+};
+
+// One `<option>` presented to ACE's dropdown menu.
+class ServoSelectPopupMenuItem : public NWebSelectPopupMenuItem {
+public:
+    ServoSelectPopupMenuItem(std::string label, bool checked)
+        : label_(std::move(label)), checked_(checked) {}
+    SelectPopupMenuItemType GetType() override { return SP_OPTION; }
+    std::string GetLabel() override { return label_; }
+    uint32_t GetAction() override { return 0; }
+    std::string GetToolTip() override { return {}; }
+    bool GetIsChecked() override { return checked_; }
+    bool GetIsEnabled() override { return true; }
+    TextDirection GetTextDirection() override { return SP_LTR; }
+    bool GetHasTextDirectionOverride() override { return false; }
+
+private:
+    std::string label_;
+    bool checked_;
+};
+
+class ServoSelectPopupMenuParam : public NWebSelectPopupMenuParam {
+public:
+    ServoSelectPopupMenuParam(std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> items, int selected,
+                              bool multiple, std::shared_ptr<NWebSelectMenuBound> bound)
+        : items_(std::move(items)), selected_(selected), multiple_(multiple), bound_(std::move(bound)) {}
+    std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> GetMenuItems() override { return items_; }
+    // Item height (vp) and font size (fp) for the ACE-rendered rows; 0 leaves the labels invisible.
+    int GetItemHeight() override { return 48; }
+    int GetSelectedItem() override { return selected_; }
+    double GetItemFontSize() override { return 16.0; }
+    bool GetIsRightAligned() override { return false; }
+    std::shared_ptr<NWebSelectMenuBound> GetSelectMenuBound() override { return bound_; }
+    bool GetIsAllowMultipleSelection() override { return multiple_; }
+
+private:
+    std::vector<std::shared_ptr<NWebSelectPopupMenuItem>> items_;
+    int selected_;
+    bool multiple_;
+    std::shared_ptr<NWebSelectMenuBound> bound_;
+};
+
+// The callback ACE invokes when the user picks an option (Continue) or dismisses the menu (Cancel).
+class ServoSelectPopupMenuCallback : public NWebSelectPopupMenuCallback {
+public:
+    explicit ServoSelectPopupMenuCallback(std::uint64_t select_id) : select_id_(select_id) {}
+    void Continue(const std::vector<int32_t>& indices) override {
+        servo::arkweb::select_popup_continue(select_id_, indices);
+    }
+    void Cancel() override { servo::arkweb::select_popup_cancel(select_id_); }
+
+private:
+    std::uint64_t select_id_;
+};
+}  // namespace
+
+bool NWebHandlerProxy::show_select_popup(std::uint64_t select_id, const std::string& labels,
+                                         std::int32_t selected, bool multiple, std::int32_t x,
+                                         std::int32_t y, std::int32_t width,
+                                         std::int32_t height) const {
+    auto h = handler();
+    if (!h) {
+        return false;
+    }
+    std::vector<std::shared_ptr<OHOS::NWeb::NWebSelectPopupMenuItem>> items;
+    std::size_t start = 0;
+    for (int index = 0; start <= labels.size(); ++index) {
+        std::size_t end = labels.find('\n', start);
+        std::string label = labels.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        items.push_back(std::make_shared<ServoSelectPopupMenuItem>(std::move(label), index == selected));
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    auto bound = std::make_shared<ServoSelectMenuBound>(x, y, width, height);
+    auto param =
+        std::make_shared<ServoSelectPopupMenuParam>(std::move(items), selected, multiple, std::move(bound));
+    auto callback = std::make_shared<ServoSelectPopupMenuCallback>(select_id);
+    h->OnSelectPopupMenu(param, callback);
+    return true;
 }
 
 bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,

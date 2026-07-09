@@ -31,6 +31,9 @@ public:
     void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
     bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind, const std::string& message,
                         const std::string& default_value) const override;
+    bool show_select_popup(std::uint64_t select_id, const std::string& labels, std::int32_t selected,
+                           bool multiple, std::int32_t x, std::int32_t y, std::int32_t width,
+                           std::int32_t height) const override;
 
 private:
     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;

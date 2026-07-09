@@ -22,7 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
 
 use cookie::Cookie;
-use cxx::{CxxString, SharedPtr};
+use cxx::{CxxString, CxxVector, SharedPtr};
 use dpi::PhysicalSize;
 use log::{LevelFilter, error, info};
 use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
@@ -36,9 +36,9 @@ use servo::{
     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
     EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
     InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
-    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
-    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
-    WebViewDelegate, WindowRenderingContext,
+    Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
+    SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
+    TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -156,6 +156,12 @@ enum Action {
         confirmed: bool,
         value: String,
     },
+    /// The user picked (or dismissed) a `<select>` popup (from the ACE popup callback thread).
+    ResolveSelectPopup {
+        select_id: u64,
+        indices: Vec<usize>,
+        cancelled: bool,
+    },
     GetCookie {
         url: String,
         include_http_only: bool,
@@ -236,6 +242,28 @@ thread_local! {
     /// reports the user's choice through the [`WebViewClient`] result callback, which routes back
     /// as an `Action`.
     static JS_DIALOGS: RefCell<HashMap<u64, SimpleDialog>> = RefCell::new(HashMap::new());
+}
+
+static NEXT_SELECT_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// `<select>` popups awaiting a choice. Like [`JS_DIALOGS`], the `!Send` `SelectElement` is
+    /// parked on the servo thread; ACE renders the dropdown itself and reports the picked option
+    /// indices through the popup callback, routed back as an `Action`.
+    static SELECT_POPUPS: RefCell<HashMap<u64, SelectElement>> = RefCell::new(HashMap::new());
+}
+
+/// Resolve a parked `<select>` popup. On a pick, apply the chosen option indices and submit; on
+/// cancel, drop the parked element (its `Drop` resubmits the current, unchanged selection).
+fn resolve_select_popup(select_id: u64, indices: Vec<usize>, cancelled: bool) {
+    SELECT_POPUPS.with(|popups| {
+        if let Some(mut select) = popups.borrow_mut().remove(&select_id) {
+            if !cancelled {
+                select.select(indices);
+                select.submit();
+            }
+        }
+    });
 }
 
 /// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
@@ -664,6 +692,11 @@ impl ServoThread {
                 confirmed,
                 value,
             } => resolve_parked_dialog(dialog_id, confirmed, value),
+            Action::ResolveSelectPopup {
+                select_id,
+                indices,
+                cancelled,
+            } => resolve_select_popup(select_id, indices, cancelled),
             Action::GetCookie {
                 url,
                 include_http_only,
@@ -1089,6 +1122,47 @@ impl WebViewDelegate for ArkWebViewDelegate {
                     resolve_parked_dialog(dialog_id, kind == 0, String::new());
                 }
             },
+            // A `<select>` dropdown. ACE renders the option menu itself; we hand it the flattened
+            // option labels + the select's on-screen rect, park the (`!Send`) element, and let the
+            // popup callback resolve it. Option indices are the flat DOM order, matching servo's ids.
+            EmbedderControl::SelectElement(select) => {
+                let select_id = NEXT_SELECT_ID.fetch_add(1, Ordering::Relaxed);
+                let mut labels: Vec<String> = Vec::new();
+                for entry in select.options() {
+                    match entry {
+                        SelectElementOptionOrOptgroup::Option(option) => {
+                            labels.push(option.label.replace('\n', " "));
+                        },
+                        SelectElementOptionOrOptgroup::Optgroup { options, .. } => {
+                            for option in options {
+                                labels.push(option.label.replace('\n', " "));
+                            }
+                        },
+                    }
+                }
+                let selected = select
+                    .selected_options()
+                    .first()
+                    .map(|&index| index as i32)
+                    .unwrap_or(-1);
+                let multiple = select.allow_select_multiple();
+                let rect = select.position();
+                let (x, y) = (rect.min.x, rect.min.y);
+                let (width, height) = (rect.width(), rect.height());
+                SELECT_POPUPS.with(|popups| popups.borrow_mut().insert(select_id, select));
+                let handled = match self.client.as_ref() {
+                    Some(client) => {
+                        cxx::let_cxx_string!(labels = labels.join("\n"));
+                        client.show_select_popup(
+                            select_id, &labels, selected, multiple, x, y, width, height,
+                        )
+                    },
+                    None => false,
+                };
+                if !handled {
+                    resolve_select_popup(select_id, Vec::new(), true);
+                }
+            },
             _ => {},
         }
     }
@@ -1420,6 +1494,26 @@ pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
             dialog_id,
             confirmed,
             value: value.to_string(),
+        })
+    })
+}
+
+pub fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
+    guard("select_popup_continue", || {
+        send(Action::ResolveSelectPopup {
+            select_id,
+            indices: indices.iter().map(|&index| index.max(0) as usize).collect(),
+            cancelled: false,
+        })
+    })
+}
+
+pub fn select_popup_cancel(select_id: u64) {
+    guard("select_popup_cancel", || {
+        send(Action::ResolveSelectPopup {
+            select_id,
+            indices: Vec::new(),
+            cancelled: true,
         })
     })
 }

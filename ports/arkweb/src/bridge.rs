@@ -8,7 +8,7 @@
 //! and simply delegate to [`crate::runtime`]. The `WebViewClient` opaque C++ type is the
 //! engine -> embedder callback sink (implemented by `NWebHandlerProxy` on the C++ side).
 
-use cxx::{CxxString, SharedPtr};
+use cxx::{CxxString, CxxVector, SharedPtr};
 
 use crate::bridge::ffi::WebViewClient;
 
@@ -95,6 +95,20 @@ pub mod ffi {
             message: &CxxString,
             default_value: &CxxString,
         ) -> bool;
+        /// Ask ACE to show a `<select>` dropdown. `labels` are the flat option labels joined by
+        /// `\n`; `selected` is the currently-selected option index (-1 if none). The user's picked
+        /// option indices come back via `select_popup_continue`/`select_popup_cancel`.
+        fn show_select_popup(
+            self: &WebViewClient,
+            select_id: u64,
+            labels: &CxxString,
+            selected: i32,
+            multiple: bool,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+        ) -> bool;
     }
 }
 
@@ -109,6 +123,11 @@ pub mod ffi_arkweb {
         /// Deliver a JS dialog result from ACE back to the parked `SimpleDialog` (see
         /// `show_js_dialog`). `value` carries the entered text for a confirmed prompt.
         fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString);
+        /// Deliver a `<select>` choice from ACE back to the parked `SelectElement`: `indices` are
+        /// the picked option indices (flat DOM order).
+        fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>);
+        /// The `<select>` popup was dismissed without a choice.
+        fn select_popup_cancel(select_id: u64);
     }
 
     unsafe extern "C++" {
@@ -221,4 +240,10 @@ fn init_logging(min_level: i32) {
 }
 fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
     crate::runtime::resolve_js_dialog(dialog_id, confirmed, value)
+}
+fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
+    crate::runtime::select_popup_continue(select_id, indices)
+}
+fn select_popup_cancel(select_id: u64) {
+    crate::runtime::select_popup_cancel(select_id)
 }
