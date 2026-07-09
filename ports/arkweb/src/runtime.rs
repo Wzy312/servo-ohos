@@ -34,9 +34,9 @@ use raw_window_handle::{
 };
 use servo::{
     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
-    EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
-    InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
-    Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
+    EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
+    InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
+    NamedKey, Opts, Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
     SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
     TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
@@ -162,6 +162,13 @@ enum Action {
         indices: Vec<usize>,
         cancelled: bool,
     },
+    /// The user chose files (or dismissed) an `<input type=file>` picker (from the ACE
+    /// file-selector value-callback thread).
+    ResolveFilePicker {
+        picker_id: u64,
+        paths: Vec<String>,
+        cancelled: bool,
+    },
     GetCookie {
         url: String,
         include_http_only: bool,
@@ -261,6 +268,31 @@ fn resolve_select_popup(select_id: u64, indices: Vec<usize>, cancelled: bool) {
             if !cancelled {
                 select.select(indices);
                 select.submit();
+            }
+        }
+    });
+}
+
+static NEXT_FILE_PICKER_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// `<input type=file>` pickers awaiting a selection. Like the other `!Send` embedder controls
+    /// the `FilePicker` is parked on the servo thread; ACE (or the app's file-selector handler)
+    /// reports the chosen paths through the value callback, routed back as an `Action`.
+    static FILE_PICKERS: RefCell<HashMap<u64, FilePicker>> = RefCell::new(HashMap::new());
+}
+
+/// Resolve a parked file picker. On a selection, set the chosen paths and submit; otherwise
+/// dismiss it (leaving the `<input>` unchanged).
+fn resolve_file_picker(picker_id: u64, paths: Vec<String>, cancelled: bool) {
+    FILE_PICKERS.with(|pickers| {
+        if let Some(mut picker) = pickers.borrow_mut().remove(&picker_id) {
+            if cancelled || paths.is_empty() {
+                picker.dismiss();
+            } else {
+                let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+                picker.select(&paths);
+                picker.submit();
             }
         }
     });
@@ -697,6 +729,11 @@ impl ServoThread {
                 indices,
                 cancelled,
             } => resolve_select_popup(select_id, indices, cancelled),
+            Action::ResolveFilePicker {
+                picker_id,
+                paths,
+                cancelled,
+            } => resolve_file_picker(picker_id, paths, cancelled),
             Action::GetCookie {
                 url,
                 include_http_only,
@@ -1163,6 +1200,35 @@ impl WebViewDelegate for ArkWebViewDelegate {
                     resolve_select_popup(select_id, Vec::new(), true);
                 }
             },
+            // A `<input type=file>` picker. Hand ACE the accept filters + multiplicity, park the
+            // (`!Send`) picker, and let the file-selector value callback resolve it. ACE has no
+            // built-in picker UI, so with no app file-selector handler this resolves as dismissed
+            // (the `<input>` keeps its previous files).
+            EmbedderControl::FilePicker(picker) => {
+                let picker_id = NEXT_FILE_PICKER_ID.fetch_add(1, Ordering::Relaxed);
+                let accept: Vec<String> = picker
+                    .filter_patterns()
+                    .iter()
+                    .map(|pattern| pattern.0.clone())
+                    .collect();
+                let multiple = picker.allow_select_multiple();
+                FILE_PICKERS.with(|pickers| pickers.borrow_mut().insert(picker_id, picker));
+                let handled = match self.client.as_ref() {
+                    Some(client) => {
+                        cxx::let_cxx_string!(accept = accept.join("\n"));
+                        client.show_file_picker(picker_id, &accept, multiple)
+                    },
+                    None => false,
+                };
+                // ACE has no built-in file picker, so with no app handler this path is otherwise
+                // invisible on screen; log it so the wiring stays observable (and testable).
+                info!(
+                    "[arkweb] file picker: accept={accept:?} multiple={multiple} handled={handled}"
+                );
+                if !handled {
+                    resolve_file_picker(picker_id, Vec::new(), true);
+                }
+            },
             _ => {},
         }
     }
@@ -1513,6 +1579,29 @@ pub fn select_popup_cancel(select_id: u64) {
         send(Action::ResolveSelectPopup {
             select_id,
             indices: Vec::new(),
+            cancelled: true,
+        })
+    })
+}
+
+pub fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
+    guard("file_picker_continue", || {
+        send(Action::ResolveFilePicker {
+            picker_id,
+            paths: paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            cancelled: false,
+        })
+    })
+}
+
+pub fn file_picker_cancel(picker_id: u64) {
+    guard("file_picker_cancel", || {
+        send(Action::ResolveFilePicker {
+            picker_id,
+            paths: Vec::new(),
             cancelled: true,
         })
     })
