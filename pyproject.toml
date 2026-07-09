@@ -50,6 +50,10 @@ ignore = [
 "**/*_tests.py" = ["ANN"]
 "**/tests/**/*.py" = ["ANN"]
 "python/servo/devtools_tests/**" = ["ANN"]
+# The ArkWeb port's on-device smoke tests (pytest); test functions and fixtures follow
+# pytest convention and are not type-annotated, like Servo's other test files above.
+"ports/arkweb/tools/test_*.py" = ["ANN"]
+"ports/arkweb/tools/conftest.py" = ["ANN"]
 
 [tool.pyrefly]
 search-path = [
