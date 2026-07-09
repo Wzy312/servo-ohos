@@ -348,7 +348,10 @@ struct ServoThread {
 }
 
 impl ServoThread {
-    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf, proxy: String) {
+    /// Build the Servo engine. This is the expensive step (`Servo::new` spins up the constellation,
+    /// networking, JS and GPU machinery), split out of [`Self::run`] so a `lazy` LibraryLoaded can
+    /// defer it until a webview is actually needed.
+    fn build(waker_chan: Sender<Action>, config_dir: PathBuf, proxy: String) -> ServoThread {
         // Install the crypto provider Servo's rustls-based networking requires for TLS.
         if rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -376,11 +379,38 @@ impl ServoThread {
             });
         }
         let servo = builder.build();
-        let mut thread = ServoThread {
+        ServoThread {
             servo,
             webviews: HashMap::new(),
+        }
+    }
+
+    fn run(
+        rx: Receiver<Action>,
+        waker_chan: Sender<Action>,
+        config_dir: PathBuf,
+        proxy: String,
+        lazy: bool,
+    ) {
+        // On a `lazy` (preload/prewarm) load, defer `Servo::new` until the first action arrives —
+        // i.e. until a webview is actually created or a bridge call needs the engine — so a
+        // preload-only process that never uses a webview pays nothing. `WakeUp`/`Vsync` can only be
+        // produced once the engine exists, so the first action here is always one that needs it.
+        let mut params = Some((waker_chan, config_dir, proxy));
+        let mut thread: Option<ServoThread> = if lazy {
+            info!("[arkweb] lazy load: deferring Servo::new until first use");
+            None
+        } else {
+            let (waker_chan, config_dir, proxy) = params.take().expect("params present");
+            Some(ServoThread::build(waker_chan, config_dir, proxy))
         };
         while let Ok(action) = rx.recv() {
+            if thread.is_none() {
+                let (waker_chan, config_dir, proxy) = params.take().expect("params present");
+                info!("[arkweb] building Servo on first use (deferred lazy init)");
+                thread = Some(ServoThread::build(waker_chan, config_dir, proxy));
+            }
+            let thread = thread.as_mut().expect("built above");
             thread.handle(action);
             thread.servo.spin_event_loop();
             thread.flush_pending_loads();
@@ -869,12 +899,12 @@ pub fn init_logging(min_level: i32) {
         .try_init();
 }
 
-pub fn initialize(options: InitOptions) -> bool {
+pub fn initialize(options: InitOptions, lazy: bool) -> bool {
     guard("initialize", || {
         init_logging(2);
         panic::set_hook(Box::new(|info| error!("[arkweb] servo panic: {info}")));
         info!(
-            "[arkweb] initialize: user_data_dir={:?} lang={:?} proxy={:?} extra_args={:?}",
+            "[arkweb] initialize: lazy={lazy} user_data_dir={:?} lang={:?} proxy={:?} extra_args={:?}",
             options.user_data_dir, options.lang, options.proxy, options.extra_args
         );
 
@@ -899,7 +929,7 @@ pub fn initialize(options: InitOptions) -> bool {
         let proxy = options.proxy;
         match thread::Builder::new()
             .name("servo-main".into())
-            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy))
+            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy, lazy))
         {
             Ok(_) => {
                 // Publish the channel only once the draining thread is alive. On a spawn failure the
