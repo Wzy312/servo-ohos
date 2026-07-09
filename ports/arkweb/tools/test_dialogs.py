@@ -28,7 +28,7 @@ import time
 
 import pytest
 
-from conftest import data_url, find_center, is_green, is_red, sample, tap
+from conftest import data_url, find_center, is_green, is_red, sample, tap, wait_for_pixel
 
 
 def _page(script: str) -> str:
@@ -51,20 +51,20 @@ PROBE = (360, 600)
 
 def test_alert_resolves_and_continues(launch, cap):
     launch(url=data_url(ALERT))
-    time.sleep(3.0)
-    assert is_green(sample(cap(), PROBE)), "alert() did not resolve -- the page's script stayed blocked"
+    img = wait_for_pixel(cap, PROBE, is_green)
+    assert is_green(sample(img, PROBE)), "alert() did not resolve -- the page's script stayed blocked"
 
 
 def test_confirm_returns_result(launch, cap):
     launch(url=data_url(CONFIRM))
-    time.sleep(3.0)
-    assert is_red(sample(cap(), PROBE)), "confirm() (no handler) did not return false"
+    img = wait_for_pixel(cap, PROBE, is_red)
+    assert is_red(sample(img, PROBE)), "confirm() (no handler) did not return false"
 
 
 def test_prompt_returns_result(launch, cap):
     launch(url=data_url(PROMPT))
-    time.sleep(3.0)
-    assert is_green(sample(cap(), PROBE)), "prompt() (no handler) did not return null"
+    img = wait_for_pixel(cap, PROBE, is_green)
+    assert is_green(sample(img, PROBE)), "prompt() (no handler) did not return null"
 
 
 # --- handled path: DialogPage shows a real dialog and returns the user's choice -----------
@@ -101,8 +101,8 @@ def test_confirm_ok_returns_true(launch, cap, dump):
     ok = _wait_for_button(dump, "OK")
     _skip_if_no_dialog(ok)
     tap(device, ok)
-    time.sleep(2.5)
-    assert is_green(sample(cap(), DIALOG_PROBE)), "confirm() did not return true after OK"
+    img = wait_for_pixel(cap, DIALOG_PROBE, is_green)
+    assert is_green(sample(img, DIALOG_PROBE)), "confirm() did not return true after OK"
 
 
 def test_confirm_cancel_returns_false(launch, cap, dump):
@@ -110,8 +110,8 @@ def test_confirm_cancel_returns_false(launch, cap, dump):
     cancel = _wait_for_button(dump, "Cancel")
     _skip_if_no_dialog(cancel)
     tap(device, cancel)
-    time.sleep(2.5)
-    assert is_red(sample(cap(), DIALOG_PROBE)), "confirm() did not return false after Cancel"
+    img = wait_for_pixel(cap, DIALOG_PROBE, is_red)
+    assert is_red(sample(img, DIALOG_PROBE)), "confirm() did not return false after Cancel"
 
 
 def test_prompt_ok_returns_value(launch, cap, dump):
@@ -119,8 +119,8 @@ def test_prompt_ok_returns_value(launch, cap, dump):
     ok = _wait_for_button(dump, "OK")
     _skip_if_no_dialog(ok)
     tap(device, ok)
-    time.sleep(2.5)
-    assert is_green(sample(cap(), DIALOG_PROBE)), "prompt() did not return the default value after OK"
+    img = wait_for_pixel(cap, DIALOG_PROBE, is_green)
+    assert is_green(sample(img, DIALOG_PROBE)), "prompt() did not return the default value after OK"
 
 
 if __name__ == "__main__":

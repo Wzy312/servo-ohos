@@ -48,9 +48,17 @@ WEB_TOP_Y = 160
 
 # --- hdc helpers -----------------------------------------------------------------------
 
+# Bound every device command. `hdc_py.cmd` forwards kwargs to `subprocess.run`, which has no
+# timeout by default, so without this a wedged device -- e.g. a servo bug that hangs the
+# ArkUI thread, which blocks `uitest dumpLayout` -- would hang a test *inside* a command and
+# never reach the wall-clock deadline in the poll helpers above it. On expiry `subprocess`
+# raises TimeoutExpired, failing the test instead of hanging the run. Generous vs. real
+# command times (snapshot/dumpLayout ~1-2s); no test command legitimately runs this long.
+CMD_TIMEOUT = 30.0
 
-def sh(device: HarmonyDevice, command: str, check: bool = True) -> str:
-    return device.cmd(command, capture_output=True, text=True, check=check).stdout
+
+def sh(device: HarmonyDevice, command: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
+    return device.cmd(command, capture_output=True, text=True, check=check, timeout=timeout).stdout
 
 
 def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
