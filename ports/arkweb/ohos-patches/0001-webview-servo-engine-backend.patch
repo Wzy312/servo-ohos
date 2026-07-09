@@ -62,7 +62,7 @@ index b04016097..bc53eb4a2 100644
  
  ARKWEB_EXPORT std::string GetArkwebLibPath();
 diff --git a/ohos_nweb/src/nweb_helper.cpp b/ohos_nweb/src/nweb_helper.cpp
-index 21180fecf..40c9c550e 100644
+index 21180fecf..dc1c4489f 100644
 --- a/ohos_nweb/src/nweb_helper.cpp
 +++ b/ohos_nweb/src/nweb_helper.cpp
 @@ -16,6 +16,7 @@
@@ -73,7 +73,7 @@ index 21180fecf..40c9c550e 100644
  #include <refbase.h>
  #include <surface.h>
  #include <thread>
-@@ -706,12 +707,83 @@ bool NWebHelper::RegisterCustomSchemes()
+@@ -706,12 +707,87 @@ bool NWebHelper::RegisterCustomSchemes()
      return true;
  }
  
@@ -91,8 +91,12 @@ index 21180fecf..40c9c550e 100644
 +{
 +    std::string libPath = OHOS::system::GetParameter("web.engine.servo.path", SERVO_ARKWEB_DEFAULT_LIB);
 +
++    // RTLD_LOCAL: the shim is self-contained (statically links its Rust/C++ dependencies) and only
++    // its two factory symbols are resolved here via dlsym on the returned handle, which works
++    // regardless of scope. Keeping its symbols out of the global scope avoids collisions with the
++    // host process (e.g. ICU, EGL loader) in the app.
 +    dlerror();
-+    void* handle = dlopen(libPath.c_str(), RTLD_NOW | RTLD_GLOBAL);
++    void* handle = dlopen(libPath.c_str(), RTLD_NOW | RTLD_LOCAL);
 +    if (handle == nullptr) {
 +        WVLOG_E("servo: dlopen('%{public}s') failed: %{public}s", libPath.c_str(), dlerror());
 +        return nullptr;
