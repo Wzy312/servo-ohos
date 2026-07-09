@@ -35,6 +35,12 @@ public:
     virtual bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
                                 const std::string& message,
                                 const std::string& default_value) const = 0;
+    // Asks ACE to show a <select> dropdown (labels joined by '\n'; selected = current index or -1;
+    // x/y/width/height = the select's on-screen rect). ACE renders the menu itself and reports the
+    // choice via servo::arkweb::select_popup_continue / select_popup_cancel.
+    virtual bool show_select_popup(std::uint64_t select_id, const std::string& labels,
+                                   std::int32_t selected, bool multiple, std::int32_t x,
+                                   std::int32_t y, std::int32_t width, std::int32_t height) const = 0;
 };
 
 }  // namespace servo::embedder

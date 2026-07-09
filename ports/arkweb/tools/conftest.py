@@ -27,6 +27,7 @@ import os
 import re
 import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -47,9 +48,17 @@ WEB_TOP_Y = 160
 
 # --- hdc helpers -----------------------------------------------------------------------
 
+# Bound every device command. `hdc_py.cmd` forwards kwargs to `subprocess.run`, which has no
+# timeout by default, so without this a wedged device -- e.g. a servo bug that hangs the
+# ArkUI thread, which blocks `uitest dumpLayout` -- would hang a test *inside* a command and
+# never reach the wall-clock deadline in the poll helpers above it. On expiry `subprocess`
+# raises TimeoutExpired, failing the test instead of hanging the run. Generous vs. real
+# command times (snapshot/dumpLayout ~1-2s); no test command legitimately runs this long.
+CMD_TIMEOUT = 30.0
 
-def sh(device: HarmonyDevice, command: str, check: bool = True) -> str:
-    return device.cmd(command, capture_output=True, text=True, check=check).stdout
+
+def sh(device: HarmonyDevice, command: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
+    return device.cmd(command, capture_output=True, text=True, check=check, timeout=timeout).stdout
 
 
 def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
@@ -144,6 +153,57 @@ def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
     local = Path(dest_dir) / os.path.basename(match.group(1))
     device.recv_file(match.group(1), str(local))
     return Image.open(local).convert("RGB")
+
+
+# --- settle-aware capture --------------------------------------------------------------
+#
+# A discrete repaint (a tap toggling a colour, an embedder control resolving) presents a
+# frame or two *after* the interaction, so a single sleep-then-cap can race the present and
+# read the pre-change frame. That premature-capture race -- not any engine latency -- is what
+# made the dialog/select frames read blank (see the servo-arkweb memory). Poll instead.
+
+
+def wait_for_pixel(
+    cap: Callable[[], Image.Image],
+    xy: tuple[int, int],
+    predicate: Callable[[tuple[int, int, int]], bool],
+    timeout: float = 8.0,
+    interval: float = 0.3,
+) -> Image.Image:
+    """Capture until ``sample(img, xy)`` satisfies ``predicate``, or ``timeout`` elapses.
+
+    Returns the matching frame; on timeout returns the last frame so the caller's assertion
+    fails against a real colour rather than a stale one. Use instead of ``sleep(); cap()``
+    around any interaction whose result appears via a repaint.
+    """
+    deadline = time.time() + timeout
+    while True:
+        img = cap()
+        if predicate(sample(img, xy)) or time.time() >= deadline:
+            return img
+        time.sleep(interval)
+
+
+def wait_until_stable(
+    cap: Callable[[], Image.Image],
+    box: tuple[int, int, int, int],
+    interval: float = 0.4,
+    timeout: float = 6.0,
+) -> Image.Image:
+    """Capture until ``box`` stops changing between consecutive frames (the present settled).
+
+    Useful when the expected colour is not known ahead of time (e.g. waiting for an ACE
+    overlay to finish animating in) -- returns the first frame that matches its predecessor.
+    """
+    deadline = time.time() + timeout
+    prev = cap()
+    while time.time() < deadline:
+        time.sleep(interval)
+        cur = cap()
+        if not region_changed(prev, cur, box):
+            return cur
+        prev = cur
+    return prev
 
 
 # --- pixel helpers (JPEG-tolerant; vote over a small neighbourhood) ---------------------
