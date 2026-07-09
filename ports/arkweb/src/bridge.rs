@@ -84,6 +84,9 @@ pub mod ffi {
 pub mod ffi_arkweb {
     extern "Rust" {
         fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool;
+        /// Evaluate JavaScript and deliver the result to the C++ callback registered under
+        /// `eval_id` (see `servo_js.h`) once it completes.
+        fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString);
         fn init_logging(min_level: i32);
     }
 
@@ -96,6 +99,11 @@ pub mod ffi_arkweb {
         /// Release an OHNativeWindow from CreateNativeWindowFromSurface (call after the rendering
         /// context using it is dropped).
         fn destroy_native_window(window: usize);
+
+        include!("servo_js.h");
+
+        /// Deliver a JavaScript evaluation result to the callback registered under `eval_id`.
+        fn deliver_js_result(eval_id: u64, value: &CxxString, success: bool);
     }
 }
 
@@ -180,6 +188,9 @@ fn cookie_clear() {
 }
 fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
     crate::runtime::key_event(id, keycode, action, unicode)
+}
+fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
+    crate::runtime::evaluate_javascript_with_callback(id, eval_id, code)
 }
 fn init_logging(min_level: i32) {
     crate::runtime::init_logging(min_level)

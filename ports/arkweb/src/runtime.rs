@@ -29,10 +29,10 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent, Key,
-    KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll, Servo,
-    ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
-    WebViewDelegate, WindowRenderingContext,
+    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
+    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll,
+    Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView,
+    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -109,6 +109,11 @@ enum Action {
         id: u32,
         code: String,
     },
+    EvaluateJavaScriptWithCallback {
+        id: u32,
+        eval_id: u64,
+        code: String,
+    },
     Key {
         id: u32,
         key: Key,
@@ -127,6 +132,26 @@ enum Action {
     ClearCookies {
         ack: Sender<()>,
     },
+}
+
+/// Render a JavaScript evaluation result as the string ArkWeb's `runJavaScript` callback expects.
+/// Strings pass through verbatim; other scalars use their JS text form; compound values fall back
+/// to a debug rendering (structured results are an `ExecuteJavaScriptExt` concern, not wired yet).
+fn js_value_to_string(value: &JSValue) -> String {
+    match value {
+        JSValue::String(string) => string.clone(),
+        JSValue::Boolean(boolean) => boolean.to_string(),
+        JSValue::Number(number) => {
+            if number.fract() == 0.0 && number.is_finite() {
+                format!("{}", *number as i64)
+            } else {
+                number.to_string()
+            }
+        },
+        JSValue::Null => "null".to_owned(),
+        JSValue::Undefined => "undefined".to_owned(),
+        other => format!("{other:?}"),
+    }
 }
 
 /// Map an OHOS (ArkUI/MMI) key code plus its unicode value to a servo [`Key`]. Named keys are
@@ -381,13 +406,35 @@ impl ServoThread {
             Action::Focus(id) => self.with_webview(id, |wv| wv.focus()),
             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
             Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
-                // Fire-and-forget for M2; the result callback is surfaced to ACE in M3.
+                // Fire-and-forget variant (ArkTS `runJavaScript` without a result callback).
                 wv.evaluate_javascript(code, |result| {
                     if let Err(error) = result {
                         error!("[arkweb] evaluate_javascript failed: {error:?}");
                     }
                 });
             }),
+            Action::EvaluateJavaScriptWithCallback { id, eval_id, code } => {
+                let webview = self
+                    .webviews
+                    .get(&id)
+                    .and_then(|entry| entry.built.as_ref())
+                    .map(|built| built.webview.clone());
+                match webview {
+                    Some(webview) => webview.evaluate_javascript(code, move |result| {
+                        let (value, success) = match result {
+                            Ok(value) => (js_value_to_string(&value), true),
+                            Err(error) => (format!("{error:?}"), false),
+                        };
+                        cxx::let_cxx_string!(value = &value);
+                        crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, success);
+                    }),
+                    // No live WebView: still release the parked C++ callback.
+                    None => {
+                        cxx::let_cxx_string!(value = "");
+                        crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, false);
+                    },
+                }
+            },
             Action::Key { id, key, state } => self.with_webview(id, |wv| {
                 wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
                     state, key,
@@ -847,6 +894,16 @@ pub fn evaluate_javascript(id: u32, code: &CxxString) {
     guard("evaluate_javascript", || {
         send(Action::EvaluateJavaScript {
             id,
+            code: code.to_string_lossy().into_owned(),
+        })
+    })
+}
+
+pub fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
+    guard("evaluate_javascript_with_callback", || {
+        send(Action::EvaluateJavaScriptWithCallback {
+            id,
+            eval_id,
             code: code.to_string_lossy().into_owned(),
         })
     })

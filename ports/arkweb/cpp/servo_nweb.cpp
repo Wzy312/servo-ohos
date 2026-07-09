@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "arkweb/src/bridge.rs.h"
+#include "servo_js.h"
 #include "servo_stub_managers.h"
 
 namespace OHOS::NWeb {
@@ -120,6 +121,15 @@ int ServoNWeb::Zoom(float zoomFactor) {
 
 void ServoNWeb::ExecuteJavaScript(const std::string& code) {
     servo::embedder::evaluate_javascript(id_, code);
+}
+
+// The result-returning form ArkTS `runJavaScript(script, callback)` routes through. The callback
+// is parked by id and invoked from the servo thread once evaluation completes (servo_js.cpp).
+void ServoNWeb::ExecuteJavaScript(const std::string& code,
+                                  std::shared_ptr<NWebMessageValueCallback> callback,
+                                  bool /*extention*/) {
+    std::uint64_t eval_id = servo::arkweb::register_js_callback(std::move(callback));
+    servo::arkweb::evaluate_javascript_with_callback(id_, eval_id, code);
 }
 
 unsigned int ServoNWeb::GetWebId() {
