@@ -16,7 +16,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::thread;
@@ -36,9 +36,9 @@ use servo::{
     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
     EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
     InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
-    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
-    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
-    WindowRenderingContext,
+    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, SimpleDialog,
+    TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+    WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -150,6 +150,12 @@ enum Action {
     ImeSendEnter {
         id: u32,
     },
+    /// The user answered a JS dialog (from the ACE dialog result callback thread).
+    ResolveJsDialog {
+        dialog_id: u64,
+        confirmed: bool,
+        value: String,
+    },
     GetCookie {
         url: String,
         include_http_only: bool,
@@ -221,6 +227,34 @@ static SERVO_CHANNEL: OnceLock<Sender<Action>> = OnceLock::new();
 static SYNC_STATES: LazyLock<Mutex<HashMap<u32, Arc<SyncState>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
+static NEXT_DIALOG_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// JS dialogs (`alert`/`confirm`/`prompt`) awaiting a user response. The `SimpleDialog` is
+    /// `!Send` and must be resolved on the servo thread, so it is parked here (both parking, from
+    /// the delegate, and resolving, from [`Action::ResolveJsDialog`], run on that thread). ACE
+    /// reports the user's choice through the [`WebViewClient`] result callback, which routes back
+    /// as an `Action`.
+    static JS_DIALOGS: RefCell<HashMap<u64, SimpleDialog>> = RefCell::new(HashMap::new());
+}
+
+/// Resolve a parked JS dialog with the user's response and unblock the page's script. A prompt
+/// carries the entered text on confirm; everything else confirms or cancels.
+fn resolve_parked_dialog(dialog_id: u64, confirmed: bool, value: String) {
+    JS_DIALOGS.with(|dialogs| {
+        let Some(dialog) = dialogs.borrow_mut().remove(&dialog_id) else {
+            return;
+        };
+        match dialog {
+            SimpleDialog::Prompt(mut prompt) if confirmed => {
+                prompt.set_current_value(&value);
+                prompt.confirm();
+            },
+            dialog if confirmed => dialog.confirm(),
+            dialog => dialog.dismiss(),
+        }
+    });
+}
 
 /// Wrap a bridge-call body so a Rust panic is logged and swallowed rather than unwinding across
 /// the C++ boundary (which cxx turns into an abort).
@@ -625,6 +659,11 @@ impl ServoThread {
             Action::ImeSendEnter { id } => {
                 self.with_webview(id, |wv| ime_press_named(wv, NamedKey::Enter, 1));
             },
+            Action::ResolveJsDialog {
+                dialog_id,
+                confirmed,
+                value,
+            } => resolve_parked_dialog(dialog_id, confirmed, value),
             Action::GetCookie {
                 url,
                 include_http_only,
@@ -1025,6 +1064,31 @@ impl WebViewDelegate for ArkWebViewDelegate {
                 self.visible_input_methods.borrow_mut().push(control_id);
                 self.on_ime_show(&input_method_control);
             },
+            // JS `alert()`/`confirm()`/`prompt()`. Park the (`!Send`) dialog on this thread keyed by
+            // an id, ask ACE to show it, and let the result callback resolve it via an `Action`.
+            EmbedderControl::SimpleDialog(dialog) => {
+                let dialog_id = NEXT_DIALOG_ID.fetch_add(1, Ordering::Relaxed);
+                let (kind, default_value) = match &dialog {
+                    SimpleDialog::Alert(_) => (0, String::new()),
+                    SimpleDialog::Confirm(_) => (1, String::new()),
+                    SimpleDialog::Prompt(prompt) => (2, prompt.current_value().to_owned()),
+                };
+                let message = dialog.message().to_owned();
+                JS_DIALOGS.with(|dialogs| dialogs.borrow_mut().insert(dialog_id, dialog));
+                let handled = match self.client.as_ref() {
+                    Some(client) => {
+                        cxx::let_cxx_string!(message = &message);
+                        cxx::let_cxx_string!(default_value = &default_value);
+                        client.show_js_dialog(dialog_id, kind, &message, &default_value)
+                    },
+                    None => false,
+                };
+                // No ACE handler: resolve so the page's script is not blocked. `alert()`
+                // acknowledges and continues; `confirm()`/`prompt()` are cancelled.
+                if !handled {
+                    resolve_parked_dialog(dialog_id, kind == 0, String::new());
+                }
+            },
             _ => {},
         }
     }
@@ -1347,6 +1411,16 @@ pub fn can_go_forward(id: u32) -> bool {
 pub fn need_soft_keyboard(id: u32) -> bool {
     guard("need_soft_keyboard", || {
         with_sync(id, |sync| sync.ime_active.load(Ordering::Relaxed))
+    })
+}
+
+pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+    guard("resolve_js_dialog", || {
+        send(Action::ResolveJsDialog {
+            dialog_id,
+            confirmed,
+            value: value.to_string(),
+        })
     })
 }
 

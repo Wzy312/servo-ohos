@@ -29,6 +29,8 @@ public:
                             const std::string& source) const override;
     void on_frame_ready() const override;
     void update_text_field_status(bool show_keyboard, bool attach_ime) const override;
+    bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind, const std::string& message,
+                        const std::string& default_value) const override;
 
 private:
     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;

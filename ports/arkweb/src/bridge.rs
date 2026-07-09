@@ -86,6 +86,15 @@ pub mod ffi {
         /// button closes the soft keyboard and it tracks the focus text field. The keyboard itself
         /// is driven by the engine's own IME connection, not by this.
         fn update_text_field_status(self: &WebViewClient, show_keyboard: bool, attach_ime: bool);
+        /// Ask ACE to show a JS dialog (`kind`: 0=alert, 1=confirm, 2=prompt) for the page. Returns
+        /// whether a handler took it; the user's response comes back via `resolve_js_dialog`.
+        fn show_js_dialog(
+            self: &WebViewClient,
+            dialog_id: u64,
+            kind: i32,
+            message: &CxxString,
+            default_value: &CxxString,
+        ) -> bool;
     }
 }
 
@@ -97,6 +106,9 @@ pub mod ffi_arkweb {
         /// `eval_id` (see `servo_js.h`) once it completes.
         fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString);
         fn init_logging(min_level: i32);
+        /// Deliver a JS dialog result from ACE back to the parked `SimpleDialog` (see
+        /// `show_js_dialog`). `value` carries the entered text for a confirmed prompt.
+        fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString);
     }
 
     unsafe extern "C++" {
@@ -206,4 +218,7 @@ fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
 }
 fn init_logging(min_level: i32) {
     crate::runtime::init_logging(min_level)
+}
+fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
+    crate::runtime::resolve_js_dialog(dialog_id, confirmed, value)
 }

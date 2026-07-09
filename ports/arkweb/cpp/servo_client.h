@@ -30,6 +30,11 @@ public:
     // Notifies ACE that an editable is focused / blurred so it tracks the focus text field and its
     // back button closes the soft keyboard (the keyboard itself is driven by the engine's own IME).
     virtual void update_text_field_status(bool show_keyboard, bool attach_ime) const = 0;
+    // Asks ACE to show a JS dialog (kind: 0=alert, 1=confirm, 2=prompt). Returns whether a handler
+    // took it; the user's response is delivered later via servo::arkweb::resolve_js_dialog.
+    virtual bool show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,
+                                const std::string& message,
+                                const std::string& default_value) const = 0;
 };
 
 }  // namespace servo::embedder
