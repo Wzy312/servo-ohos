@@ -1,3 +1,18 @@
+# Fork of servo/servo
+
+> [!NOTE]
+> This is an **experimental downstream fork** of [servo/servo](https://github.com/servo/servo)
+> carrying additional OpenHarmony-related patches (e.g. the ArkWeb port and
+> OHOS-specific integration). The `ohos-main` branch is regularly rebased onto
+> upstream `main` and carries the downstream patches on top. For anything not
+> OHOS-specific, please contribute to upstream instead. 
+> See CONTRIBUTING.md for details
+
+
+Original upstream servo Readme below:
+
+-------------------
+
 # The Servo Parallel Browser Engine Project
 
 Servo is a prototype web browser engine written in the
