@@ -474,7 +474,15 @@ impl ServoThread {
                                     size.width,
                                     size.height,
                                 );
-                                built.rendering_context.resize(size);
+                                // `WebView::resize` resizes the shared rendering context itself (via
+                                // the painter) *and* issues the WebRender document-view + display-list
+                                // update that schedules the repaint. Do not resize the context
+                                // directly first: the painter early-returns when the context is
+                                // already at the target size, which skips that repaint and leaves the
+                                // stale frame until the next unrelated event (e.g. a tap) — most
+                                // visibly a half-height page after the soft keyboard closes. Buffer
+                                // geometry is still set above, before the surfman resize `resize()`
+                                // performs.
                                 built.webview.resize(size);
                                 true
                             },
