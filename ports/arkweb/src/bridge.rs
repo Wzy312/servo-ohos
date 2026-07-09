@@ -18,6 +18,8 @@ pub mod ffi {
     struct InitOptions {
         user_data_dir: String,
         lang: String,
+        /// HTTP(S) proxy URI (from the `web.engine.servo.proxy` system param); empty for none.
+        proxy: String,
         extra_args: Vec<String>,
     }
 
