@@ -148,13 +148,7 @@ fn js_value_to_string(value: &JSValue) -> String {
     match value {
         JSValue::String(string) => string.clone(),
         JSValue::Boolean(boolean) => boolean.to_string(),
-        JSValue::Number(number) => {
-            if number.fract() == 0.0 && number.is_finite() {
-                format!("{}", *number as i64)
-            } else {
-                number.to_string()
-            }
-        },
+        JSValue::Number(number) => crate::convert::format_js_number(*number),
         JSValue::Null => "null".to_owned(),
         JSValue::Undefined => "undefined".to_owned(),
         other => format!("{other:?}"),
@@ -177,12 +171,7 @@ fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
         2081 => NamedKey::Home,         // KEY_MOVE_HOME
         2082 => NamedKey::End,          // KEY_MOVE_END
         _ => {
-            return u32::try_from(unicode)
-                .ok()
-                .filter(|&u| u != 0)
-                .and_then(char::from_u32)
-                .filter(|c| !c.is_control())
-                .map(|c| Key::Character(c.to_string()));
+            return crate::convert::printable_char(unicode).map(|c| Key::Character(c.to_string()));
         },
     };
     Some(Key::Named(named))
@@ -913,18 +902,24 @@ pub fn initialize(options: InitOptions, lazy: bool) -> bool {
             error!("[arkweb] failed to create config dir {config_dir:?}: {error}");
         }
 
-        let (tx, rx) = mpsc::channel::<Action>();
-        if SERVO_CHANNEL.set(tx.clone()).is_err() {
+        if SERVO_CHANNEL.get().is_some() {
             info!("[arkweb] already initialized");
             return true;
         }
-        let waker_chan = tx;
+        let (tx, rx) = mpsc::channel::<Action>();
+        let waker_chan = tx.clone();
         let proxy = options.proxy;
         match thread::Builder::new()
             .name("servo-main".into())
             .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy, lazy))
         {
-            Ok(_) => true,
+            Ok(_) => {
+                // Publish the channel only once the draining thread is alive. On a spawn failure the
+                // engine then stays uninitialized (and `initialize` remains retryable) instead of
+                // installing a channel whose receiver never runs and silently swallowing every call.
+                let _ = SERVO_CHANNEL.set(tx);
+                true
+            },
             Err(error) => {
                 error!("[arkweb] failed to spawn servo-main thread: {error}");
                 false
@@ -1051,11 +1046,24 @@ pub fn evaluate_javascript(id: u32, code: &CxxString) {
 
 pub fn evaluate_javascript_with_callback(id: u32, eval_id: u64, code: &CxxString) {
     guard("evaluate_javascript_with_callback", || {
-        send(Action::EvaluateJavaScriptWithCallback {
+        let action = Action::EvaluateJavaScriptWithCallback {
             id,
             eval_id,
             code: code.to_string_lossy().into_owned(),
-        })
+        };
+        let queued = SERVO_CHANNEL
+            .get()
+            .is_some_and(|tx| tx.send(action).is_ok());
+        // The C++ side already parked a callback under `eval_id`. If the engine is not running the
+        // action is dropped and that callback (and the ArkTS `runJavaScript` promise) would hang
+        // forever, so release it here. The live-engine paths deliver from the servo thread instead.
+        if !queued {
+            error!(
+                "[arkweb] evaluate_javascript_with_callback before engine ready; releasing callback"
+            );
+            cxx::let_cxx_string!(value = "");
+            crate::bridge::ffi_arkweb::deliver_js_result(eval_id, &value, false);
+        }
     })
 }
 
@@ -1102,8 +1110,13 @@ pub fn key_event(id: u32, keycode: i32, action: i32, unicode: i32) -> bool {
         let Some(key) = oh_key_to_servo_key(keycode, unicode) else {
             return false;
         };
-        send(Action::Key { id, key, state });
-        true
+        // Report the dispatch as unhandled if the engine is not running, so ACE falls back to its
+        // own key handling instead of assuming we consumed the event.
+        let Some(tx) = SERVO_CHANNEL.get() else {
+            error!("[arkweb] key_event before InitializeWebEngine");
+            return false;
+        };
+        tx.send(Action::Key { id, key, state }).is_ok()
     })
 }
 

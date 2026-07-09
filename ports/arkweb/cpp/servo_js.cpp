@@ -21,7 +21,7 @@ std::uint64_t register_js_callback(std::shared_ptr<OHOS::NWeb::NWebMessageValueC
     return id;
 }
 
-void deliver_js_result(std::uint64_t eval_id, const std::string& value, bool /*success*/) {
+void deliver_js_result(std::uint64_t eval_id, const std::string& value, bool success) {
     std::shared_ptr<OHOS::NWeb::NWebMessageValueCallback> callback;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -31,11 +31,22 @@ void deliver_js_result(std::uint64_t eval_id, const std::string& value, bool /*s
             g_callbacks.erase(it);
         }
     }
-    if (callback) {
+    if (!callback) {
+        return;
+    }
+    if (success) {
         // runJavaScript (non-Ext) expects a string result; wrap it in a STRING NWebMessage.
         auto message =
             std::make_shared<OHOS::NWeb::NWebMessage>(OHOS::NWeb::NWebValue::Type::STRING);
         message->SetString(value);
+        callback->OnReceiveValue(std::move(message));
+    } else {
+        // Evaluation failed: deliver an ERROR message so the ArkTS `runJavaScript` promise rejects,
+        // rather than resolving with an internal debug string as a fake success value.
+        auto message =
+            std::make_shared<OHOS::NWeb::NWebMessage>(OHOS::NWeb::NWebValue::Type::ERROR);
+        message->SetErrName("EvaluationError");
+        message->SetErrMsg(value);
         callback->OnReceiveValue(std::move(message));
     }
 }
