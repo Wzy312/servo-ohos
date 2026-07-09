@@ -83,4 +83,10 @@ void NWebHandlerProxy::on_console_message(std::int32_t level, const std::string&
 // Presentation is driven directly on the servo side (EGL swap); nothing to forward.
 void NWebHandlerProxy::on_frame_ready() const {}
 
+void NWebHandlerProxy::update_text_field_status(bool show_keyboard, bool attach_ime) const {
+    if (auto h = handler()) {
+        h->UpdateTextFieldStatus(show_keyboard, attach_ime);
+    }
+}
+
 }  // namespace servo::arkweb

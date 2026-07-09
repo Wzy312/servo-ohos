@@ -897,6 +897,10 @@ impl ArkWebViewDelegate {
             }
         }
         self.sync.ime_active.store(true, Ordering::Relaxed);
+        // Let ACE track the focus text field so its back button closes the keyboard.
+        if let Some(client) = self.client.as_ref() {
+            client.update_text_field_status(true, true);
+        }
     }
 
     /// Detach the OHOS IME (hides the soft keyboard) when the editable is blurred.
@@ -907,6 +911,9 @@ impl ArkWebViewDelegate {
                 error!("[arkweb] IME: hide keyboard failed");
             }
             // Dropping the proxy detaches the InputMethodController.
+        }
+        if let Some(client) = self.client.as_ref() {
+            client.update_text_field_status(false, false);
         }
     }
 }
