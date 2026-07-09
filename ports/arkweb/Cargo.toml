@@ -26,6 +26,10 @@ hilog = { workspace = true }
 # force inprocess: ohos is single-process for now, mirroring servoshell.
 ipc-channel = { workspace = true, features = ["force-inprocess"] }
 log = { workspace = true }
+# Connects to the OHOS InputMethod framework (libohinputmethod NDK) for soft-keyboard IME,
+# the same public SDK path servoshell's OHOS port uses.
+ohos-ime = { workspace = true }
+ohos-ime-sys = { workspace = true }
 ohos-vsync = { workspace = true }
 raw-window-handle = { workspace = true }
 # aws-lc-rs: the crypto provider Servo's rustls-based networking needs installed for TLS.

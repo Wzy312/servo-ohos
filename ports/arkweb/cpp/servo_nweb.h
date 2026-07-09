@@ -32,6 +32,7 @@ public:
     void OnTouchCancel() override;
     bool SendKeyEvent(int32_t keyCode, int32_t keyAction) override;
     bool SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyboardEvent) override;
+    bool NeedSoftKeyboard() override;
     int Load(const std::string& url) override;
     bool IsNavigatebackwardAllowed() override;
     bool IsNavigateForwardAllowed() override;

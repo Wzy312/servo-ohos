@@ -85,6 +85,13 @@ bool ServoNWeb::SendKeyboardEvent(const std::shared_ptr<NWebKeyboardEvent>& keyb
                                     keyboardEvent->GetUnicode());
 }
 
+// Servo owns the system IME connection itself (via the OHOS InputMethod NDK). ACE still queries
+// this to decide whether to perform keyboard-avoidance layout; report true while Servo has an
+// editable focused and the soft keyboard up.
+bool ServoNWeb::NeedSoftKeyboard() {
+    return servo::embedder::need_soft_keyboard(id_);
+}
+
 int ServoNWeb::Load(const std::string& url) {
     servo::embedder::load_url(id_, url);
     return 0;
