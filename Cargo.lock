@@ -460,6 +460,8 @@ dependencies = [
  "hilog",
  "ipc-channel",
  "log",
+ "ohos-ime",
+ "ohos-ime-sys",
  "ohos-vsync",
  "raw-window-handle",
  "rustls",

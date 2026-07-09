@@ -25,16 +25,20 @@ use cookie::Cookie;
 use cxx::{CxxString, SharedPtr};
 use dpi::PhysicalSize;
 use log::{LevelFilter, error, info};
+use ohos_ime::{AttachOptions, Ime, ImeProxy, RawTextEditorProxy};
+use ohos_ime_sys::types::InputMethod_EnterKeyType;
 use ohos_vsync::NativeVsync;
 use raw_window_handle::{
     DisplayHandle, OhosDisplayHandle, OhosNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
     WindowHandle,
 };
 use servo::{
-    ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
-    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, Preferences, RefreshDriver,
-    RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId,
-    TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
+    EmbedderControl, EmbedderControlId, EventLoopWaker, ImeEvent, InputEvent, InputMethodControl,
+    InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts,
+    Preferences, RefreshDriver, RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent,
+    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
 use url::Url;
 
@@ -56,6 +60,10 @@ struct SyncState {
     progress: AtomicI32,
     can_back: AtomicBool,
     can_fwd: AtomicBool,
+    /// Whether an editable element is focused and the soft keyboard is up. Read on ACE threads by
+    /// `ServoNWeb::NeedSoftKeyboard` so ACE performs keyboard-avoidance layout; set on the servo
+    /// thread from the IME show/hide delegate callbacks.
+    ime_active: AtomicBool,
 }
 
 /// Messages sent from ACE threads to the servo thread. Every variant carries only `Send` data.
@@ -126,6 +134,22 @@ enum Action {
         key: Key,
         state: KeyState,
     },
+    /// Soft-keyboard text committed by the OHOS IME (fired from the IME callback thread).
+    ImeInsertText {
+        id: u32,
+        text: String,
+    },
+    ImeDeleteForward {
+        id: u32,
+        len: usize,
+    },
+    ImeDeleteBackward {
+        id: u32,
+        len: usize,
+    },
+    ImeSendEnter {
+        id: u32,
+    },
     GetCookie {
         url: String,
         include_http_only: bool,
@@ -175,6 +199,22 @@ fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
         },
     };
     Some(Key::Named(named))
+}
+
+/// Synthesize `count` presses (down+up) of a named key. Used to turn the IME's
+/// delete-forward/backward and enter callbacks into Servo key events (Servo edits the focused
+/// field in response), mirroring servoshell's OHOS port.
+fn ime_press_named(webview: &WebView, key: NamedKey, count: usize) {
+    for _ in 0..count {
+        webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+            KeyState::Down,
+            Key::Named(key),
+        )));
+        webview.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+            KeyState::Up,
+            Key::Named(key),
+        )));
+    }
 }
 
 static SERVO_CHANNEL: OnceLock<Sender<Action>> = OnceLock::new();
@@ -575,6 +615,16 @@ impl ServoThread {
                     state, key,
                 )));
             }),
+            Action::ImeInsertText { id, text } => self.ime_insert_text(id, text),
+            Action::ImeDeleteForward { id, len } => {
+                self.with_webview(id, |wv| ime_press_named(wv, NamedKey::Delete, len));
+            },
+            Action::ImeDeleteBackward { id, len } => {
+                self.with_webview(id, |wv| ime_press_named(wv, NamedKey::Backspace, len));
+            },
+            Action::ImeSendEnter { id } => {
+                self.with_webview(id, |wv| ime_press_named(wv, NamedKey::Enter, 1));
+            },
             Action::GetCookie {
                 url,
                 include_http_only,
@@ -637,6 +687,30 @@ impl ServoThread {
         {
             f(&built.webview);
         }
+    }
+
+    /// Deliver soft-keyboard-committed text to the focused editable, mirroring servoshell's OHOS
+    /// port: bracket the composed text with `Process` key events so Servo treats it as IME input
+    /// rather than synthetic key presses.
+    fn ime_insert_text(&self, id: u32, text: String) {
+        // On OHOS the IME sometimes emits a trailing empty commit; ignore it.
+        if text.is_empty() {
+            return;
+        }
+        self.with_webview(id, |wv| {
+            wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+                KeyState::Down,
+                Key::Named(NamedKey::Process),
+            )));
+            wv.notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
+                state: CompositionState::End,
+                data: text,
+            })));
+            wv.notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
+                KeyState::Up,
+                Key::Named(NamedKey::Process),
+            )));
+        });
     }
 
     /// Load any URL that was requested before its WebView existed or its browsing context was
@@ -712,9 +786,12 @@ impl ServoThread {
         };
 
         let delegate = Rc::new(ArkWebViewDelegate {
+            id,
             sync,
             client,
             rendering_context: rendering_context.clone(),
+            ime_proxy: RefCell::new(None),
+            visible_input_methods: RefCell::new(Vec::new()),
         });
         let webview = WebViewBuilder::new(&self.servo, rendering_context.clone())
             .delegate(delegate)
@@ -769,9 +846,68 @@ impl ServoThread {
 /// Per-webview delegate: mirrors Servo notifications into the [`SyncState`] cache and the C++
 /// [`WebViewClient`] sink. Invoked on the servo thread (documented MVP constraint).
 struct ArkWebViewDelegate {
+    id: u32,
     sync: Arc<SyncState>,
     client: SharedPtr<WebViewClient>,
     rendering_context: Rc<WindowRenderingContext>,
+    /// The live OHOS IME connection while an editable is focused; attaching it shows the soft
+    /// keyboard, dropping it detaches and hides it. `!Send`, but the delegate only ever runs on the
+    /// servo thread.
+    ime_proxy: RefCell<Option<ImeProxy>>,
+    /// Ids of the input-method controls Servo currently considers visible. `hide_embedder_control`
+    /// only tears the IME down when the matching control is dismissed (other controls also arrive
+    /// through the same callbacks).
+    visible_input_methods: RefCell<Vec<EmbedderControlId>>,
+}
+
+impl ArkWebViewDelegate {
+    /// Attach the OHOS IME for a newly focused editable element (shows the soft keyboard). The
+    /// text-editor proxy forwards the IME's insert/delete/enter callbacks back to the servo thread
+    /// as [`Action`]s keyed by this webview id.
+    fn on_ime_show(&self, control: &InputMethodControl) {
+        let mut ime_proxy = self.ime_proxy.borrow_mut();
+        if ime_proxy.is_none() {
+            let options = convert_ime_options(control.input_method_type(), control.multiline());
+            let text_config = ohos_ime::TextConfigBuilder::new()
+                .input_type(options.input_type)
+                .enterkey_type(options.enterkey_type)
+                .build();
+            let editor = match RawTextEditorProxy::new(Box::new(ServoIme {
+                id: self.id,
+                text_config,
+            })) {
+                Ok(editor) => editor,
+                Err(error) => {
+                    error!("[arkweb] IME: create text editor proxy failed: {error:?}");
+                    return;
+                },
+            };
+            match ImeProxy::new(editor, AttachOptions::new(true)) {
+                Ok(proxy) => *ime_proxy = Some(proxy),
+                Err(error) => {
+                    error!("[arkweb] IME: attach failed: {error:?}");
+                    return;
+                },
+            }
+        }
+        if let Some(proxy) = ime_proxy.as_ref() {
+            if proxy.show_keyboard().is_err() {
+                error!("[arkweb] IME: show keyboard failed");
+            }
+        }
+        self.sync.ime_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Detach the OHOS IME (hides the soft keyboard) when the editable is blurred.
+    fn on_ime_hide(&self) {
+        self.sync.ime_active.store(false, Ordering::Relaxed);
+        if let Some(proxy) = self.ime_proxy.take() {
+            if proxy.hide_keyboard().is_err() {
+                error!("[arkweb] IME: hide keyboard failed");
+            }
+            // Dropping the proxy detaches the InputMethodController.
+        }
+    }
 }
 
 impl WebViewDelegate for ArkWebViewDelegate {
@@ -868,6 +1004,103 @@ impl WebViewDelegate for ArkWebViewDelegate {
         if let Some(client) = self.client.as_ref() {
             client.on_frame_ready();
         }
+    }
+
+    fn show_embedder_control(&self, _webview: WebView, embedder_control: EmbedderControl) {
+        let control_id = embedder_control.id();
+        match embedder_control {
+            // Only raise the soft keyboard when the focus was driven by a user gesture; otherwise
+            // dropping the control sends the default response. Servo delivers the typed text back
+            // through the IME text-editor proxy, so no further handling of the control is needed.
+            EmbedderControl::InputMethod(input_method_control)
+                if input_method_control.allow_virtual_keyboard() =>
+            {
+                self.visible_input_methods.borrow_mut().push(control_id);
+                self.on_ime_show(&input_method_control);
+            },
+            _ => {},
+        }
+    }
+
+    fn hide_embedder_control(&self, _webview: WebView, control_id: EmbedderControlId) {
+        let mut visible = self.visible_input_methods.borrow_mut();
+        if let Some(index) = visible.iter().position(|id| *id == control_id) {
+            visible.remove(index);
+            drop(visible);
+            self.on_ime_hide();
+        }
+    }
+}
+
+/// A Servo-backed OHOS text editor. Its callbacks fire on the OHOS IME helper thread and forward
+/// the typed text to the servo thread as [`Action`]s keyed by `id`.
+struct ServoIme {
+    id: u32,
+    text_config: ohos_ime::TextConfig,
+}
+
+impl Ime for ServoIme {
+    fn insert_text(&self, text: String) {
+        send(Action::ImeInsertText { id: self.id, text });
+    }
+
+    fn delete_forward(&self, len: usize) {
+        send(Action::ImeDeleteForward { id: self.id, len });
+    }
+
+    fn delete_backward(&self, len: usize) {
+        send(Action::ImeDeleteBackward { id: self.id, len });
+    }
+
+    fn get_text_config(&self) -> &ohos_ime::TextConfig {
+        &self.text_config
+    }
+
+    fn send_enter_key(&self, _enter_key: InputMethod_EnterKeyType) {
+        send(Action::ImeSendEnter { id: self.id });
+    }
+}
+
+struct OhosImeOptions {
+    input_type: ohos_ime_sys::types::InputMethod_TextInputType,
+    enterkey_type: InputMethod_EnterKeyType,
+}
+
+/// Translate Servo's [`InputMethodType`] (and whether the field is multiline) into the OHOS IME's
+/// keyboard type and enter-key label. Mirrors servoshell's OHOS port.
+fn convert_ime_options(input_method_type: InputMethodType, multiline: bool) -> OhosImeOptions {
+    use ohos_ime_sys::types::InputMethod_TextInputType as IME_TextInputType;
+    let input_fallback = IME_TextInputType::IME_TEXT_INPUT_TYPE_TEXT;
+    let input_type = match input_method_type {
+        InputMethodType::Color => input_fallback,
+        InputMethodType::Date => input_fallback,
+        InputMethodType::DatetimeLocal => IME_TextInputType::IME_TEXT_INPUT_TYPE_DATETIME,
+        InputMethodType::Email => IME_TextInputType::IME_TEXT_INPUT_TYPE_EMAIL_ADDRESS,
+        InputMethodType::Month => input_fallback,
+        InputMethodType::Number => IME_TextInputType::IME_TEXT_INPUT_TYPE_NUMBER,
+        InputMethodType::Password => IME_TextInputType::IME_TEXT_INPUT_TYPE_NEW_PASSWORD,
+        InputMethodType::Search => IME_TextInputType::IME_TEXT_INPUT_TYPE_TEXT,
+        InputMethodType::Tel => IME_TextInputType::IME_TEXT_INPUT_TYPE_PHONE,
+        InputMethodType::Text => {
+            if multiline {
+                IME_TextInputType::IME_TEXT_INPUT_TYPE_MULTILINE
+            } else {
+                IME_TextInputType::IME_TEXT_INPUT_TYPE_TEXT
+            }
+        },
+        InputMethodType::Time => input_fallback,
+        InputMethodType::Url => IME_TextInputType::IME_TEXT_INPUT_TYPE_URL,
+        InputMethodType::Week => input_fallback,
+    };
+    let enterkey_type = match (input_method_type, multiline) {
+        (InputMethodType::Text, true) => InputMethod_EnterKeyType::IME_ENTER_KEY_NEWLINE,
+        (InputMethodType::Text, false) => InputMethod_EnterKeyType::IME_ENTER_KEY_DONE,
+        (InputMethodType::Search, false) => InputMethod_EnterKeyType::IME_ENTER_KEY_SEARCH,
+        _ => InputMethod_EnterKeyType::IME_ENTER_KEY_UNSPECIFIED,
+    };
+    OhosImeOptions {
+        input_type,
+        enterkey_type,
     }
 }
 
@@ -1101,6 +1334,12 @@ pub fn can_go_back(id: u32) -> bool {
 pub fn can_go_forward(id: u32) -> bool {
     guard("can_go_forward", || {
         with_sync(id, |sync| sync.can_fwd.load(Ordering::Relaxed))
+    })
+}
+
+pub fn need_soft_keyboard(id: u32) -> bool {
+    guard("need_soft_keyboard", || {
+        with_sync(id, |sync| sync.ime_active.load(Ordering::Relaxed))
     })
 }
 

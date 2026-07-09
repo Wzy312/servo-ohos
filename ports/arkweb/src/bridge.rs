@@ -50,6 +50,9 @@ pub mod ffi {
         fn get_progress(id: u32) -> i32;
         fn can_go_back(id: u32) -> bool;
         fn can_go_forward(id: u32) -> bool;
+        /// Whether an editable element is focused and the soft keyboard is up, so ACE performs
+        /// keyboard-avoidance layout (`ServoNWeb::NeedSoftKeyboard`).
+        fn need_soft_keyboard(id: u32) -> bool;
 
         // Engine-global cookie access, backed by Servo's site-data manager (sync rendezvous).
         fn cookie_get(url: &CxxString, include_http_only: bool) -> String;
@@ -178,6 +181,9 @@ fn can_go_back(id: u32) -> bool {
 }
 fn can_go_forward(id: u32) -> bool {
     crate::runtime::can_go_forward(id)
+}
+fn need_soft_keyboard(id: u32) -> bool {
+    crate::runtime::need_soft_keyboard(id)
 }
 fn cookie_get(url: &CxxString, include_http_only: bool) -> String {
     crate::runtime::cookie_get(url, include_http_only)
