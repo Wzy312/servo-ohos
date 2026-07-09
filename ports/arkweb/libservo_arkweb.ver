@@ -1,0 +1,20 @@
+# Linker version script for libservo_arkweb.so on OpenHarmony.
+#
+# The shared library is dlopen'd by the patched NWeb helper (the SERVO backend branch of
+# nweb_helper.cpp), which resolves exactly these two factory / ABI symbols via dlsym. They are the
+# only supported entry points into the library.
+#
+# Note: on its own this script does not shrink the dynamic symbol table -- rustc auto-generates a
+# competing `--version-script` for the cdylib that globalizes every reachable `#[no_mangle]` symbol,
+# and lld unions version scripts, so `local: *` here cannot demote them. The dependency/std symbols
+# are instead hidden by `-Wl,--exclude-libs,ALL` (see build.rs). This script documents the intended
+# public ABI and mirrors the servoshell OpenHarmony port's `.ver` convention.
+#
+# See https://sourceware.org/binutils/docs/ld/VERSION.html for more information.
+{
+    global:
+        servo_arkweb_create_nweb_engine;
+        servo_arkweb_abi_version;
+    local:
+        *;
+};
