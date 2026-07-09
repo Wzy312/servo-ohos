@@ -41,6 +41,9 @@ public:
     void Reload() override;
     int Zoom(float zoomFactor) override;
     void ExecuteJavaScript(const std::string& code) override;
+    void ExecuteJavaScript(const std::string& code,
+                           std::shared_ptr<NWebMessageValueCallback> callback,
+                           bool extention) override;
     unsigned int GetWebId() override;
     void SetNWebHandler(std::shared_ptr<NWebHandler> handler) override;
     std::string GetUrl() override;
