@@ -22,8 +22,24 @@ using CreateNativeWindowFromSurfaceFn = void* (*)(void*);
 
 #define SERVO_LOGI(...) OH_LOG_Print(LOG_APP, LOG_INFO, 0xE0C3, "ServoArkWeb", __VA_ARGS__)
 
+// Read an OHOS system parameter. GetParameter (libbegetutil) is not in the NDK, so it is resolved
+// at runtime from the app process, like the other inner-API symbols this shim uses.
+std::string ReadSystemParam(const char* key) {
+    using GetParameterFn = int (*)(const char*, const char*, char*, unsigned int);
+    static auto get_parameter = reinterpret_cast<GetParameterFn>(dlsym(RTLD_DEFAULT, "GetParameter"));
+    if (get_parameter == nullptr) {
+        return {};
+    }
+    char buffer[256] = {0};
+    int len = get_parameter(key, "", buffer, sizeof(buffer));
+    return len > 0 ? std::string(buffer, static_cast<size_t>(len)) : std::string{};
+}
+
 servo::embedder::InitOptions ParseInitOptions(const std::shared_ptr<NWebEngineInitArgs>& init_args) {
     servo::embedder::InitOptions options{};
+    // Dev/testing aid: route Servo's networking through an HTTP proxy (e.g. an `hdc rport`
+    // reverse-forward to a host proxy). Set via `param set web.engine.servo.proxy <uri>`.
+    options.proxy = ReadSystemParam("web.engine.servo.proxy");
     if (init_args) {
         constexpr std::string_view kUserDataDir = "--user-data-dir=";
         constexpr std::string_view kLang = "--lang=";

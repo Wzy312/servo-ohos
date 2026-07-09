@@ -30,9 +30,9 @@ use raw_window_handle::{
 };
 use servo::{
     ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
-    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, RenderingContext, Scroll,
-    Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView,
-    WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, Preferences,
+    RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId,
+    TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -260,7 +260,7 @@ struct ServoThread {
 }
 
 impl ServoThread {
-    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf) {
+    fn run(rx: Receiver<Action>, waker_chan: Sender<Action>, config_dir: PathBuf, proxy: String) {
         // Install the crypto provider Servo's rustls-based networking requires for TLS.
         if rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
@@ -275,10 +275,19 @@ impl ServoThread {
             config_dir: Some(config_dir),
             ..Default::default()
         };
-        let servo = ServoBuilder::default()
-            .opts(opts)
-            .event_loop_waker(waker)
-            .build();
+        // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
+        // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
+        // is used). Both schemes go through the same CONNECT-capable proxy.
+        let mut builder = ServoBuilder::default().opts(opts).event_loop_waker(waker);
+        if !proxy.is_empty() {
+            info!("[arkweb] using network proxy {proxy}");
+            builder = builder.preferences(Preferences {
+                network_http_proxy_uri: proxy.clone(),
+                network_https_proxy_uri: proxy,
+                ..Default::default()
+            });
+        }
+        let servo = builder.build();
         let mut thread = ServoThread {
             servo,
             webviews: HashMap::new(),
@@ -753,8 +762,8 @@ pub fn initialize(options: InitOptions) -> bool {
         init_logging(2);
         panic::set_hook(Box::new(|info| error!("[arkweb] servo panic: {info}")));
         info!(
-            "[arkweb] initialize: user_data_dir={:?} lang={:?} extra_args={:?}",
-            options.user_data_dir, options.lang, options.extra_args
+            "[arkweb] initialize: user_data_dir={:?} lang={:?} proxy={:?} extra_args={:?}",
+            options.user_data_dir, options.lang, options.proxy, options.extra_args
         );
 
         // Servo needs a writable `config_dir` (used for the OHOS font cache and prefs). The OHOS
@@ -775,9 +784,10 @@ pub fn initialize(options: InitOptions) -> bool {
         }
         let (tx, rx) = mpsc::channel::<Action>();
         let waker_chan = tx.clone();
+        let proxy = options.proxy;
         match thread::Builder::new()
             .name("servo-main".into())
-            .spawn(move || ServoThread::run(rx, waker_chan, config_dir))
+            .spawn(move || ServoThread::run(rx, waker_chan, config_dir, proxy))
         {
             Ok(_) => {
                 // Publish the channel only once the draining thread is alive. On a spawn failure the
