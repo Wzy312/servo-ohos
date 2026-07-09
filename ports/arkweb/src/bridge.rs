@@ -24,7 +24,7 @@ pub mod ffi {
     }
 
     extern "Rust" {
-        fn initialize(options: InitOptions) -> bool;
+        fn initialize(options: InitOptions, lazy: bool) -> bool;
         fn shutdown();
         fn create_webview(
             window_handle: usize,
@@ -111,8 +111,8 @@ pub mod ffi_arkweb {
 
 // ---- `extern "Rust"` implementations (resolved by cxx as `super::<name>`). ----
 
-fn initialize(options: ffi::InitOptions) -> bool {
-    crate::runtime::initialize(options)
+fn initialize(options: ffi::InitOptions, lazy: bool) -> bool {
+    crate::runtime::initialize(options, lazy)
 }
 fn shutdown() {
     crate::runtime::shutdown()

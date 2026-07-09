@@ -118,12 +118,16 @@ std::shared_ptr<NWeb> ServoNWebEngine::GetNWeb(int32_t nweb_id) {
 // checks that the engine object exists), but LibraryLoaded is always called from GetWebEngine,
 // before any web component creates an NWeb. `initialize` is idempotent, so a later
 // InitializeWebEngine call is a no-op.
-void ServoNWebEngine::LibraryLoaded(std::shared_ptr<NWebEngineInitArgs> init_args, bool /*lazy*/) {
-    servo::embedder::initialize(ParseInitOptions(init_args));
+//
+// `lazy` is forwarded so a preload/prewarm load defers the expensive Servo::new until a webview is
+// actually created (see runtime::initialize). Because LibraryLoaded always runs first, its `lazy`
+// governs; InitializeWebEngine's eager (false) is only honoured if it somehow runs first.
+void ServoNWebEngine::LibraryLoaded(std::shared_ptr<NWebEngineInitArgs> init_args, bool lazy) {
+    servo::embedder::initialize(ParseInitOptions(init_args), lazy);
 }
 
 void ServoNWebEngine::InitializeWebEngine(std::shared_ptr<NWebEngineInitArgs> init_args) {
-    servo::embedder::initialize(ParseInitOptions(init_args));
+    servo::embedder::initialize(ParseInitOptions(init_args), false);
 }
 
 void ServoNWebEngine::SetWebTag(int32_t /*nweb_id*/, const char* /*web_tag*/) {}
