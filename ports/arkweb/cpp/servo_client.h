@@ -41,6 +41,11 @@ public:
     virtual bool show_select_popup(std::uint64_t select_id, const std::string& labels,
                                    std::int32_t selected, bool multiple, std::int32_t x,
                                    std::int32_t y, std::int32_t width, std::int32_t height) const = 0;
+    // Asks ACE to show an <input type=file> picker (accept filters joined by '\n', empty for none;
+    // multiple = allow several files). Returns whether a handler took it; the chosen paths arrive
+    // via servo::arkweb::file_picker_continue / file_picker_cancel.
+    virtual bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
+                                  bool multiple) const = 0;
 };
 
 }  // namespace servo::embedder

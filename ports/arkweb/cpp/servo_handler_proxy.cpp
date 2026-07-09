@@ -6,8 +6,10 @@
 
 #include "arkweb/src/bridge.rs.h"
 #include "ohos_nweb/nweb_console_log.h"
+#include "ohos_nweb/nweb_file_selector_params.h"
 #include "ohos_nweb/nweb_js_dialog_result.h"
 #include "ohos_nweb/nweb_select_popup_menu.h"
+#include "ohos_nweb/nweb_value_callback.h"
 
 namespace servo::arkweb {
 
@@ -205,6 +207,68 @@ bool NWebHandlerProxy::show_select_popup(std::uint64_t select_id, const std::str
     auto callback = std::make_shared<ServoSelectPopupMenuCallback>(select_id);
     h->OnSelectPopupMenu(param, callback);
     return true;
+}
+
+namespace {
+
+// The <input type=file> parameters handed to ACE / the app's file-selector handler.
+class ServoFileSelectorParams : public NWebFileSelectorParams {
+public:
+    ServoFileSelectorParams(std::vector<std::string> accept_types, bool multiple)
+        : accept_types_(std::move(accept_types)), multiple_(multiple) {}
+    const std::string Title() override { return {}; }
+    FileSelectorMode Mode() override {
+        return multiple_ ? FILE_OPEN_MULTIPLE_MODE : FILE_OPEN_MODE;
+    }
+    const std::string DefaultFilename() override { return {}; }
+    const AcceptTypeList AcceptType() override { return accept_types_; }
+    bool IsCapture() override { return false; }
+
+private:
+    std::vector<std::string> accept_types_;
+    bool multiple_;
+};
+
+// The value callback ACE / the app invokes with the chosen file paths (an empty list means the
+// selection was cancelled), routed back to the parked Servo FilePicker by id.
+class ServoFileSelectorCallback : public NWebStringVectorValueCallback {
+public:
+    explicit ServoFileSelectorCallback(std::uint64_t picker_id) : picker_id_(picker_id) {}
+    void OnReceiveValue(const std::vector<std::string>& value) override {
+        if (value.empty()) {
+            servo::arkweb::file_picker_cancel(picker_id_);
+        } else {
+            servo::arkweb::file_picker_continue(picker_id_, value);
+        }
+    }
+
+private:
+    std::uint64_t picker_id_;
+};
+}  // namespace
+
+bool NWebHandlerProxy::show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
+                                        bool multiple) const {
+    auto h = handler();
+    if (!h) {
+        return false;
+    }
+    std::vector<std::string> types;
+    if (!accept_types.empty()) {
+        std::size_t start = 0;
+        while (start <= accept_types.size()) {
+            std::size_t end = accept_types.find('\n', start);
+            types.push_back(accept_types.substr(
+                start, end == std::string::npos ? std::string::npos : end - start));
+            if (end == std::string::npos) {
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    auto params = std::make_shared<ServoFileSelectorParams>(std::move(types), multiple);
+    auto callback = std::make_shared<ServoFileSelectorCallback>(picker_id);
+    return h->OnFileSelectorShow(callback, params);
 }
 
 bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind,

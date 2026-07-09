@@ -109,6 +109,16 @@ pub mod ffi {
             width: i32,
             height: i32,
         ) -> bool;
+        /// Ask ACE to show a `<input type=file>` picker. `accept_types` are the accept filter
+        /// patterns joined by `\n` (empty for none); `multiple` allows selecting several files.
+        /// Returns whether a handler took it; the chosen paths come back via
+        /// `file_picker_continue`/`file_picker_cancel`.
+        fn show_file_picker(
+            self: &WebViewClient,
+            picker_id: u64,
+            accept_types: &CxxString,
+            multiple: bool,
+        ) -> bool;
     }
 }
 
@@ -128,6 +138,11 @@ pub mod ffi_arkweb {
         fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>);
         /// The `<select>` popup was dismissed without a choice.
         fn select_popup_cancel(select_id: u64);
+        /// Deliver the chosen file paths from ACE back to the parked `FilePicker` (see
+        /// `show_file_picker`).
+        fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>);
+        /// The file picker was dismissed without a selection.
+        fn file_picker_cancel(picker_id: u64);
     }
 
     unsafe extern "C++" {
@@ -246,4 +261,10 @@ fn select_popup_continue(select_id: u64, indices: &CxxVector<i32>) {
 }
 fn select_popup_cancel(select_id: u64) {
     crate::runtime::select_popup_cancel(select_id)
+}
+fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
+    crate::runtime::file_picker_continue(picker_id, paths)
+}
+fn file_picker_cancel(picker_id: u64) {
+    crate::runtime::file_picker_cancel(picker_id)
 }
