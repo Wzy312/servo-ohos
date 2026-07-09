@@ -6,11 +6,12 @@
 //! ArkTS side reads synchronously (`getUrl()`, `accessBackward()`, ...) are cached in a shared
 //! [`SyncState`] that the [`ArkWebViewDelegate`] updates on the servo thread.
 //!
-//! Touch, scroll and key input are translated into servo `InputEvent`s here. Not yet wired: the
-//! OHOS vsync refresh driver (this uses the default timer-based driver for now).
+//! Touch, scroll and key input are translated into servo `InputEvent`s here. Presentation is driven
+//! by the OHOS display vsync through [`VsyncRefreshDriver`] (one per built `WebView`).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_longlong, c_void};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -24,13 +25,14 @@ use cookie::Cookie;
 use cxx::{CxxString, SharedPtr};
 use dpi::PhysicalSize;
 use log::{LevelFilter, error, info};
+use ohos_vsync::NativeVsync;
 use raw_window_handle::{
     DisplayHandle, OhosDisplayHandle, OhosNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
     WindowHandle,
 };
 use servo::{
     ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D, EventLoopWaker, InputEvent,
-    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, Preferences,
+    JSValue, Key, KeyState, KeyboardEvent, LoadStatus, NamedKey, Opts, Preferences, RefreshDriver,
     RenderingContext, Scroll, Servo, ServoBuilder, TouchEvent, TouchEventType, TouchId,
     TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
 };
@@ -59,6 +61,11 @@ struct SyncState {
 /// Messages sent from ACE threads to the servo thread. Every variant carries only `Send` data.
 enum Action {
     WakeUp,
+    /// The OHOS framework signalled a display vsync; `id` selects the webview whose
+    /// [`VsyncRefreshDriver`] requested it (see [`on_vsync_cb`]).
+    Vsync {
+        id: u32,
+    },
     CreateWebView {
         id: u32,
         window_handle: usize,
@@ -231,10 +238,91 @@ impl EventLoopWaker for ArkWaker {
     }
 }
 
+/// A [`RefreshDriver`] backed by the OHOS display vsync. One is created per built [`WebView`] and
+/// owns that webview's `OH_NativeVSync` handle, so destroying the webview drops the handle and the
+/// vsync subscription with it — no callbacks fire once a webview is gone. Callbacks are requested
+/// on demand (only when Servo observes the next frame and none is already pending), so an idle page
+/// does not keep the display awake either.
+struct VsyncRefreshDriver {
+    /// The webview this driver belongs to, smuggled through the vsync callback data so [`on_vsync_cb`]
+    /// can route the notification back here.
+    id: u32,
+    start_frame_callbacks: RefCell<Vec<Box<dyn Fn() + Send>>>,
+    native_vsync: NativeVsync,
+}
+
+impl VsyncRefreshDriver {
+    fn new(id: u32) -> Option<Rc<Self>> {
+        let native_vsync = match NativeVsync::new(&format!("ServoArkWeb-{id}")) {
+            Ok(native_vsync) => native_vsync,
+            Err(error) => {
+                error!("[arkweb] failed to create NativeVsync for id={id}: {error:?}");
+                return None;
+            },
+        };
+        Some(Rc::new(Self {
+            id,
+            start_frame_callbacks: RefCell::new(Vec::new()),
+            native_vsync,
+        }))
+    }
+
+    /// Run every frame-start callback queued since the last vsync. Called on the servo thread when
+    /// an [`Action::Vsync`] for this webview arrives.
+    fn notify_vsync(&self) {
+        let callbacks: Vec<_> = self.start_frame_callbacks.borrow_mut().drain(..).collect();
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    /// Ask the OHOS framework to invoke [`on_vsync_cb`] once on the next vsync.
+    fn request_callback(&self) {
+        // SAFETY: `on_vsync_cb` has static lifetime, and the callback data is the webview id passed
+        // as an integer (never dereferenced), so it stays valid even if this driver is dropped
+        // before the callback fires.
+        if let Err(error) = unsafe {
+            self.native_vsync
+                .request_raw_callback(Some(on_vsync_cb), self.id as usize as *mut c_void)
+        } {
+            error!(
+                "[arkweb] failed to request vsync callback for id={}: {error:?}",
+                self.id
+            );
+        }
+    }
+}
+
+impl RefreshDriver for VsyncRefreshDriver {
+    fn observe_next_frame(&self, start_frame_callback: Box<dyn Fn() + Send + 'static>) {
+        // Only request a vsync callback when the queue was empty; otherwise one is already pending
+        // for this frame.
+        let was_empty = {
+            let mut callbacks = self.start_frame_callbacks.borrow_mut();
+            let was_empty = callbacks.is_empty();
+            callbacks.push(start_frame_callback);
+            was_empty
+        };
+        if was_empty {
+            self.request_callback();
+        }
+    }
+}
+
+/// Vsync callback. Runs on the OHOS framework's vsync helper thread, so it only routes the signal
+/// to the servo thread; `data` is the webview id (see [`VsyncRefreshDriver::request_callback`]).
+unsafe extern "C" fn on_vsync_cb(_timestamp: c_longlong, data: *mut c_void) {
+    send(Action::Vsync {
+        id: data as usize as u32,
+    });
+}
+
 /// The Servo `WebView`, built lazily once a real size is known. The rendering context is held by
 /// the painter and the delegate (which paints through it), so it is not kept here separately.
 struct BuiltWebView {
     webview: WebView,
+    /// Owns the `OH_NativeVSync` handle; dropped (unsubscribing) when this webview is destroyed.
+    refresh_driver: Rc<VsyncRefreshDriver>,
 }
 
 struct WebViewEntry {
@@ -303,6 +391,17 @@ impl ServoThread {
     fn handle(&mut self, action: Action) {
         match action {
             Action::WakeUp => {},
+            Action::Vsync { id } => {
+                // Run the queued frame-start callbacks for this webview; the ensuing
+                // `spin_event_loop` (in `run`) produces and presents the frame.
+                if let Some(built) = self
+                    .webviews
+                    .get(&id)
+                    .and_then(|entry| entry.built.as_ref())
+                {
+                    built.refresh_driver.notify_vsync();
+                }
+            },
             Action::CreateWebView {
                 id,
                 window_handle,
@@ -575,7 +674,17 @@ impl ServoThread {
             size.width,
             size.height,
         );
-        let rendering_context = match WindowRenderingContext::new(display, window, size) {
+        // Drive presentation from the display vsync. The driver owns its `OH_NativeVSync` handle, so
+        // the subscription is released when this webview (and thus `BuiltWebView`) is dropped.
+        let Some(refresh_driver) = VsyncRefreshDriver::new(id) else {
+            return;
+        };
+        let rendering_context = match WindowRenderingContext::new_with_refresh_driver(
+            display,
+            window,
+            size,
+            refresh_driver.clone(),
+        ) {
             Ok(context) => Rc::new(context),
             Err(error) => {
                 error!("[arkweb] build webview id={id}: rendering context: {error:?}");
@@ -595,7 +704,10 @@ impl ServoThread {
         webview.show();
 
         if let Some(entry) = self.webviews.get_mut(&id) {
-            entry.built = Some(BuiltWebView { webview });
+            entry.built = Some(BuiltWebView {
+                webview,
+                refresh_driver,
+            });
         }
         info!(
             "[arkweb] built webview id={id} at {}x{}",
