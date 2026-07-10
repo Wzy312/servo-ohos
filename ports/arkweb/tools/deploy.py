@@ -39,6 +39,9 @@ OHOS_LIB_NAMES = ("libarkweb_utils.z.so", "libarkweb_core_loader.z.so")
 # Servo engine type in arkweb_utils (ArkWebEngineType::SERVO); the value the enforce param takes.
 SERVO_ENGINE_TYPE = 100
 
+# Set only on vendor distributions of OpenHarmony; unset on vanilla OpenHarmony.
+DIST_NAME_PARAM = "const.product.os.dist.name"
+
 DEFAULT_SERVO_DEST = "/system/lib64/libservo_arkweb.so"
 
 # Space margin required on the target partition beyond the pushed payload (temp/inode slack).
@@ -97,6 +100,12 @@ def parse_args() -> argparse.Namespace:
         help="Do not set web.engine.enforce (only push libraries).",
     )
     parser.add_argument(
+        "--allow-non-openharmony",
+        action="store_true",
+        help="Deploy even when the device reports a vendor OS distribution (e.g. HarmonyOS). "
+        "The shim is not expected to work there; only useful if the detection is wrong.",
+    )
+    parser.add_argument(
         "--setenforce-permissive",
         action="store_true",
         help="Run 'setenforce 0' so SELinux does not block dlopen of the shim (dev devices only).",
@@ -129,6 +138,21 @@ def device_shell(device: HarmonyDevice, command: str, check: bool = True) -> str
     """Run a shell command on the device and return its stdout as text."""
     result = device.cmd(command, capture_output=True, text=True, check=check)
     return (result.stdout or "").strip()
+
+
+def detect_distribution(device: HarmonyDevice) -> str | None:
+    """Return the vendor OS distribution name, or None for vanilla OpenHarmony.
+
+    OpenHarmony defines ``const.product.os.dist.*`` only for vendor *distributions* built on
+    top of it (a HarmonyOS device reports ``HarmonyOS``); a vanilla OpenHarmony build leaves
+    the parameter unset. Note ``const.ohos.fullname`` cannot be used for this: it reports the
+    underlying OpenHarmony base on distributions too, so a HarmonyOS phone answers
+    ``OpenHarmony-7.0.0.101`` and would pass a naive check.
+    """
+    value = device_shell(device, f"param get {DIST_NAME_PARAM} 2>/dev/null", check=False)
+    if not value or "fail!" in value or "errNum" in value:
+        return None
+    return value
 
 
 def discover_device_path(device: HarmonyDevice, lib_name: str, search_root: str) -> str:
@@ -218,6 +242,17 @@ def main() -> None:
     hdc = Hdc(hdc_path=args.hdc)
     device = resolve_device(hdc, args.target)
     print(f"target: {device.target}")
+
+    distribution = detect_distribution(device)
+    if distribution and not args.allow_non_openharmony:
+        sys.exit(
+            f"error: device reports the '{distribution}' OS distribution, not vanilla OpenHarmony.\n"
+            "The shim implements the OpenHarmony NWeb ABI and is only reachable through the SERVO "
+            "branch of a patched nweb_helper; a vendor distribution ships its own ArkWeb, so "
+            "overwriting its system libraries cannot select Servo and can break the device's web "
+            "stack. Pass --allow-non-openharmony to override."
+        )
+    print(f"OS distribution: {distribution or 'none (vanilla OpenHarmony)'}")
 
     transfers = build_transfers(args, device)
     print("planned transfers:")
