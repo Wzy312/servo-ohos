@@ -18,7 +18,7 @@ crate-type = ["cdylib"]
 # Note: freetype is bundled (compiled from source) by default on ohos; there is no
 # `bundled_freetype` servo feature. `dynamic_freetype` would opt into dynamic linking.
 [target.'cfg(target_env = "ohos")'.dependencies]
-servo = { workspace = true, default-features = false, features = ["js_jit"] }
+servo = { workspace = true, default-features = false, features = ["js_jit", "clipboard"] }
 cookie = { workspace = true }
 cxx = { workspace = true }
 dpi = { workspace = true }
