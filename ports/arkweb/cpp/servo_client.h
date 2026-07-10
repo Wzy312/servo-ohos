@@ -46,6 +46,19 @@ public:
     // via servo::arkweb::file_picker_continue / file_picker_cancel.
     virtual bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
                                   bool multiple) const = 0;
+    // Asks ACE to show a geolocation permission prompt for `origin` (ArkTS onGeolocationShow).
+    // Returns whether a handler took it; the decision arrives via servo::arkweb::resolve_permission.
+    virtual bool show_geolocation_permission(std::uint64_t request_id,
+                                             const std::string& origin) const = 0;
+    // Asks ACE to show a permission prompt (ArkTS onPermissionRequest). `resources` is the
+    // NWebAccessRequest resource bitmask (1<<1 video capture, 1<<2 audio capture). Returns whether
+    // a handler took it; the decision arrives via servo::arkweb::resolve_permission.
+    virtual bool show_permission_request(std::uint64_t request_id, const std::string& origin,
+                                         std::int32_t resources) const = 0;
+    // Asks ACE to show an HTTP-auth login prompt (ArkTS onHttpAuthRequest). Returns whether a
+    // handler took it; credentials arrive via servo::arkweb::resolve_http_auth.
+    virtual bool show_http_auth_request(std::uint64_t request_id, const std::string& host,
+                                        const std::string& realm) const = 0;
 };
 
 }  // namespace servo::embedder

@@ -55,6 +55,10 @@ uv run --with pytest --with hdc-py --with pillow python -m pytest ports/arkweb/t
 uv run ports/arkweb/tools/test_scroll.py
 ```
 
+With more than one device attached the suite refuses to guess: pass `--target=<serial>`, or
+set `HDC_TARGET=<serial>` (which also works for the single-file form above, whose `__main__`
+does not forward arguments to pytest). A lone attached device needs neither.
+
 The session fixture skips everything when no device is connected or the shim is not
 deployed, sets `web.engine.enforce=100` if unset (not persistent across reboots), and wakes
 and unlocks the screen. The IME tests additionally need a default input method on the

@@ -28,6 +28,19 @@ function colorPage(name: string, color: string): string {
   return 'data:text/html,' + encodeURIComponent(html);
 }
 
+// Requests the current position on load and paints the outcome: green = got a position,
+// red = permission denied (code 1), blue = granted but unavailable/timeout. Grey = still waiting.
+function geoPage(): string {
+  const html = `<html><head><title>geo-page</title></head>
+<body style="margin:0;background:#dddddd">
+<script>
+navigator.geolocation.getCurrentPosition(
+  function(p){document.body.style.background='#00cc00';},
+  function(e){document.body.style.background=(e.code===1)?'#cc0000':'#2244cc';});
+</script></body></html>`;
+  return 'data:text/html,' + encodeURIComponent(html);
+}
+
 @Entry
 @Component
 struct ControllerPage {
@@ -146,6 +159,10 @@ struct ControllerPage {
           this.controller.resumeAllMedia();
           return 'ok';
         }))
+        this.apiButton('loadGeo', () => this.invoke('loadGeo', () => {
+          this.controller.loadUrl(geoPage());
+          return 'ok';
+        }))
       }
     }
     .width('100%')
@@ -164,6 +181,27 @@ struct ControllerPage {
           if (event) {
             report('pageEnd', event.url.substring(0, 80));
           }
+        })
+        .onGeolocationShow((event) => {
+          if (event) {
+            report('geoShow', event.origin);
+            event.geolocation.invoke(event.origin, true, false);
+          }
+        })
+        .onPermissionRequest((event) => {
+          if (event) {
+            report('permission', event.request.getOrigin());
+            // Deny camera/microphone: Servo's OHOS getUserMedia backend is unimplemented, so
+            // granting would let the page proceed into an unsupported capture path.
+            event.request.deny();
+          }
+        })
+        .onHttpAuthRequest((event) => {
+          if (event) {
+            report('httpAuth', `${event.host}|${event.realm}`);
+            event.handler.confirm('user', 'passwd');
+          }
+          return true;
         })
     }
     .width('100%')
