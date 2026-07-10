@@ -6,9 +6,9 @@
 
 Exercises in-engine link navigation and the app's history-back button (Load /
 NavigateBack / can_go_back). Page A (green) links to page B (red); tapping the link must
-render B, and the back button must return to A. Content is checked by colour, so this is
-independent of the known URL-bar-stale-on-history-back gap (that is the ArkTS URL bar, not
-the web content). See conftest.py for the harness/provisioning notes.
+render B, and the back button must return to A. Content is checked by colour; the URL bar's
+own history-back sync is covered separately in test_urlbar.py. See conftest.py for the
+harness/provisioning notes.
 """
 
 import pytest

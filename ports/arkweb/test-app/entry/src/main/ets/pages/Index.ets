@@ -189,6 +189,14 @@ struct Index {
             markInstant('PageEnd', 3);
           }
         })
+        // Fires on navigations that don't trigger a fresh page load, e.g.
+        // history back/forward and history.pushState, so the URL bar stays in
+        // sync where onPageBegin/onPageEnd don't fire.
+        .onRefreshAccessedHistory((event) => {
+          if (event !== undefined) {
+            this.urlBar = event.url;
+          }
+        })
         .onFirstContentfulPaint(event => {
           markInstant('FirstContentfulPaint', 4);
           if (event !== undefined) {
