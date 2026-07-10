@@ -1229,6 +1229,15 @@ impl WebViewDelegate for ArkWebViewDelegate {
                     resolve_file_picker(picker_id, Vec::new(), true);
                 }
             },
+            // `<input type=color>`: OHOS/ACE exposes no colour-chooser hook (Chromium-based ArkWeb
+            // shows the picker inside the engine itself, so there is nothing to delegate to, and no
+            // system picker like the file input gets). Resolve immediately with the input's current
+            // value — non-blocking, keeps the colour unchanged. A real picker would need a bespoke
+            // ArkUI overlay, which belongs in the embedder, not the engine shim.
+            EmbedderControl::ColorPicker(picker) => {
+                info!("[arkweb] colour picker: no ACE hook, keeping current value");
+                picker.submit();
+            },
             _ => {},
         }
     }
