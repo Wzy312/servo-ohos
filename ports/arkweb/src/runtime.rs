@@ -36,9 +36,10 @@ use servo::{
     CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
     EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
     InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
-    NamedKey, Opts, Preferences, RefreshDriver, RenderingContext, Scroll, SelectElement,
-    SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent, TouchEventType,
-    TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate, WindowRenderingContext,
+    MediaSessionActionType, MediaSessionEvent, NamedKey, Opts, Preferences, RefreshDriver,
+    RenderingContext, Scroll, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder,
+    SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
+    WebViewDelegate, WindowRenderingContext,
 };
 use url::Url;
 
@@ -64,6 +65,9 @@ struct SyncState {
     /// `ServoNWeb::NeedSoftKeyboard` so ACE performs keyboard-avoidance layout; set on the servo
     /// thread from the IME show/hide delegate callbacks.
     ime_active: AtomicBool,
+    /// Last media-session playback state, stored as the OHOS `MediaPlaybackState` values
+    /// (0 = NONE, 1 = PLAYING, 2 = PAUSED). Read by `ServoNWeb::GetMediaPlaybackState`.
+    playback_state: AtomicI32,
 }
 
 /// Messages sent from ACE threads to the servo thread. Every variant carries only `Send` data.
@@ -94,6 +98,10 @@ enum Action {
     Reload(u32),
     GoBack(u32),
     GoForward(u32),
+    GoBackOrForward {
+        id: u32,
+        step: i32,
+    },
     Resize {
         id: u32,
         width: u32,
@@ -114,6 +122,16 @@ enum Action {
         id: u32,
         dx: f32,
         dy: f32,
+    },
+    PageScroll {
+        id: u32,
+        up: bool,
+        to_edge: bool,
+    },
+    /// See the `media_session_action` bridge doc for the `action` values.
+    MediaSessionAction {
+        id: u32,
+        action: i32,
     },
     Focus(u32),
     SetPageZoom {
@@ -605,6 +623,13 @@ impl ServoThread {
             Action::GoForward(id) => self.with_webview(id, |wv| {
                 wv.go_forward(1);
             }),
+            Action::GoBackOrForward { id, step } => self.with_webview(id, |wv| {
+                if step < 0 {
+                    wv.go_back(step.unsigned_abs() as usize);
+                } else if step > 0 {
+                    wv.go_forward(step as usize);
+                }
+            }),
             Action::Resize { id, width, height } => {
                 info!("[arkweb] resize id={id} {width}x{height}");
                 let size = PhysicalSize::new(width.max(1), height.max(1));
@@ -640,6 +665,8 @@ impl ServoThread {
                 }
             },
             Action::SetThrottled { id, throttled } => {
+                // Observability marker for the on-device throttle tests (test_throttle.py).
+                info!("[arkweb] set_throttled id={id} {throttled}");
                 self.with_webview(id, |wv| wv.set_throttled(throttled))
             },
             Action::Touch {
@@ -682,6 +709,36 @@ impl ServoThread {
                     }
                 }
             },
+            Action::PageScroll { id, up, to_edge } => {
+                if let Some(entry) = self.webviews.get(&id) {
+                    if let Some(built) = entry.built.as_ref() {
+                        let height = entry.size.height as f32;
+                        let scroll = match (up, to_edge) {
+                            (true, true) => Scroll::Start,
+                            (false, true) => Scroll::End,
+                            (up, false) => {
+                                let dy = if up { -height } else { height };
+                                Scroll::Delta(DeviceVector2D::new(0.0, dy).into())
+                            },
+                        };
+                        let point =
+                            DevicePoint::new(entry.size.width as f32 / 2.0, height / 2.0).into();
+                        built.webview.notify_scroll_event(scroll, point);
+                    }
+                }
+            },
+            Action::MediaSessionAction { id, action } => self.with_webview(id, |wv| {
+                let action = match action {
+                    0 => MediaSessionActionType::Play,
+                    1 => MediaSessionActionType::Pause,
+                    2 => MediaSessionActionType::Stop,
+                    other => {
+                        error!("[arkweb] unknown media session action {other}");
+                        return;
+                    },
+                };
+                wv.notify_media_session_action_event(action);
+            }),
             Action::Focus(id) => self.with_webview(id, |wv| wv.focus()),
             Action::SetPageZoom { id, zoom } => self.with_webview(id, |wv| wv.set_page_zoom(zoom)),
             Action::EvaluateJavaScript { id, code } => self.with_webview(id, |wv| {
@@ -1115,6 +1172,16 @@ impl WebViewDelegate for ArkWebViewDelegate {
         }
     }
 
+    fn notify_media_session_event(&self, _webview: WebView, event: MediaSessionEvent) {
+        if let MediaSessionEvent::PlaybackStateChange(state) = event {
+            // Servo's MediaSessionPlaybackState is 1-based (None_=1); OHOS MediaPlaybackState is
+            // 0-based (NONE=0, PLAYING=1, PAUSED=2).
+            self.sync
+                .playback_state
+                .store(state as i32 - 1, Ordering::Relaxed);
+        }
+    }
+
     fn notify_new_frame_ready(&self, webview: WebView) {
         // ACE creates the NWeb at a 1x1 placeholder and resizes to the real size once laid out.
         // Presenting into a 1x1 surface makes WebRender report OutOfMemory every frame and panic
@@ -1462,6 +1529,12 @@ pub fn go_back(id: u32) {
     guard("go_back", || send(Action::GoBack(id)))
 }
 
+pub fn navigate_back_or_forward(id: u32, step: i32) {
+    guard("navigate_back_or_forward", || {
+        send(Action::GoBackOrForward { id, step })
+    })
+}
+
 pub fn go_forward(id: u32) {
     guard("go_forward", || send(Action::GoForward(id)))
 }
@@ -1499,6 +1572,18 @@ pub fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
 
 pub fn scroll_by(id: u32, dx: f32, dy: f32) {
     guard("scroll_by", || send(Action::Scroll { id, dx, dy }))
+}
+
+pub fn page_scroll(id: u32, up: bool, to_edge: bool) {
+    guard("page_scroll", || {
+        send(Action::PageScroll { id, up, to_edge })
+    })
+}
+
+pub fn media_session_action(id: u32, action: i32) {
+    guard("media_session_action", || {
+        send(Action::MediaSessionAction { id, action })
+    })
 }
 
 pub fn set_page_zoom(id: u32, zoom: f32) {
@@ -1570,6 +1655,12 @@ pub fn can_go_forward(id: u32) -> bool {
 pub fn need_soft_keyboard(id: u32) -> bool {
     guard("need_soft_keyboard", || {
         with_sync(id, |sync| sync.ime_active.load(Ordering::Relaxed))
+    })
+}
+
+pub fn get_media_playback_state(id: u32) -> i32 {
+    guard("get_media_playback_state", || {
+        with_sync(id, |sync| sync.playback_state.load(Ordering::Relaxed))
     })
 }
 

@@ -3,6 +3,7 @@
 #include <utility>
 
 #include "arkweb/src/bridge.rs.h"
+#include "ohos_nweb/nweb_web_message.h"
 #include "servo_js.h"
 #include "servo_stub_managers.h"
 
@@ -14,6 +15,42 @@ constexpr std::uint8_t kTouchDown = 0;
 constexpr std::uint8_t kTouchMove = 1;
 constexpr std::uint8_t kTouchUp = 2;
 constexpr std::uint8_t kTouchCancel = 3;
+
+// Media-session actions, matching the `action` argument of the `media_session_action` bridge
+// function.
+constexpr std::int32_t kMediaActionPlay = 0;
+constexpr std::int32_t kMediaActionPause = 1;
+constexpr std::int32_t kMediaActionStop = 2;
+
+// ACE stores and dereferences the returned drag data (web_delegate.cpp GetOrCreateDragData), so
+// GetOrCreateDragData must return non-null even though Servo exposes no drag payload yet.
+class ServoDragData : public NWebDragData {
+public:
+    std::string GetLinkURL() override { return {}; }
+    std::string GetFragmentText() override { return {}; }
+    std::string GetFragmentHtml() override { return {}; }
+    bool GetPixelMapSetting(const void** /*data*/, size_t& /*len*/, int& /*width*/,
+                            int& /*height*/) override {
+        return false;
+    }
+    bool SetFragmentHtml(const std::string& /*html*/) override { return false; }
+    bool SetPixelMapSetting(const void* /*data*/, size_t /*len*/, int /*width*/,
+                            int /*height*/) override {
+        return false;
+    }
+    bool SetLinkURL(const std::string& /*url*/) override { return false; }
+    bool SetFragmentText(const std::string& /*text*/) override { return false; }
+    std::string GetLinkTitle() override { return {}; }
+    bool SetLinkTitle(const std::string& /*title*/) override { return false; }
+    void GetDragStartPosition(int& x, int& y) override {
+        x = 0;
+        y = 0;
+    }
+    bool IsSingleImageContent() override { return false; }
+    bool SetFileUri(const std::string& /*uri*/) override { return false; }
+    std::string GetImageFileName() override { return {}; }
+    void ClearImageFileNames() override {}
+};
 }  // namespace
 
 ServoNWeb::ServoNWeb(uint32_t id, std::shared_ptr<servo::arkweb::NWebHandlerProxy> proxy)
@@ -24,14 +61,35 @@ void ServoNWeb::Resize(uint32_t width, uint32_t height, bool /*isKeyboard*/) {
 }
 
 void ServoNWeb::OnPause() {
-    servo::embedder::set_throttled(id_, true);
+    paused_ = true;
+    UpdateThrottled();
 }
 
 void ServoNWeb::OnContinue() {
-    servo::embedder::set_throttled(id_, false);
+    paused_ = false;
+    UpdateThrottled();
+}
+
+// The RS surface-occlusion callback is not on the OnPause path, so without these Servo keeps
+// rendering at full rate while fully covered by another window.
+void ServoNWeb::OnOccluded() {
+    occluded_ = true;
+    UpdateThrottled();
+}
+
+void ServoNWeb::OnUnoccluded() {
+    occluded_ = false;
+    UpdateThrottled();
+}
+
+void ServoNWeb::UpdateThrottled() {
+    servo::embedder::set_throttled(id_, paused_ || occluded_);
 }
 
 void ServoNWeb::OnDestroy() {
+    if (native_destroy_callback_ != nullptr) {
+        native_destroy_callback_(native_destroy_web_name_.c_str());
+    }
     servo::embedder::destroy_webview(id_);
 }
 
@@ -117,6 +175,10 @@ void ServoNWeb::NavigateForward() {
     servo::embedder::go_forward(id_);
 }
 
+void ServoNWeb::NavigateBackOrForward(int step) {
+    servo::embedder::navigate_back_or_forward(id_, step);
+}
+
 void ServoNWeb::Reload() {
     servo::embedder::reload(id_);
 }
@@ -154,6 +216,21 @@ std::string ServoNWeb::GetUrl() {
     return std::string(url.data(), url.size());
 }
 
+std::string ServoNWeb::Title() {
+    auto title = servo::embedder::get_title(id_);
+    return std::string(title.data(), title.size());
+}
+
+int ServoNWeb::PageLoadProgress() {
+    return servo::embedder::get_progress(id_);
+}
+
+// Servo tracks no pre-redirect URL; the committed URL is the closest available answer.
+const std::string ServoNWeb::GetOriginalUrl() {
+    auto url = servo::embedder::get_url(id_);
+    return std::string(url.data(), url.size());
+}
+
 // ScrollTo is absolute; the bridge currently exposes only relative scrolling. Approximated
 // for the MVP (proper absolute scroll tracked for a later milestone).
 void ServoNWeb::ScrollTo(float x, float y) {
@@ -164,12 +241,83 @@ void ServoNWeb::ScrollBy(float delta_x, float delta_y) {
     servo::embedder::scroll_by(id_, delta_x, delta_y);
 }
 
+// Nested-scroll handoff from an enclosing ArkUI scrollable. The fling velocity is dropped:
+// Servo exposes no velocity-scroll injection, and the delta alone keeps content tracking.
+void ServoNWeb::ScrollByRefScreen(float delta_x, float delta_y, float /*vx*/, float /*vy*/) {
+    servo::embedder::scroll_by(id_, delta_x, delta_y);
+}
+
+void ServoNWeb::PageUp(bool top) {
+    servo::embedder::page_scroll(id_, true, top);
+}
+
+void ServoNWeb::PageDown(bool bottom) {
+    servo::embedder::page_scroll(id_, false, bottom);
+}
+
+// These reach the page's *active media session* only; a page that never touches the
+// MediaSession API may not respond (documented Tier-1 limitation).
+void ServoNWeb::PauseAllMedia() {
+    servo::embedder::media_session_action(id_, kMediaActionPause);
+}
+
+void ServoNWeb::ResumeAllMedia() {
+    servo::embedder::media_session_action(id_, kMediaActionPlay);
+}
+
+void ServoNWeb::StopAllMedia() {
+    servo::embedder::media_session_action(id_, kMediaActionStop);
+}
+
+int ServoNWeb::GetMediaPlaybackState() {
+    return servo::embedder::get_media_playback_state(id_);
+}
+
 void ServoNWeb::PutBackgroundColor(int color) {
     background_color_ = color;
 }
 
 std::shared_ptr<NWebPreference> ServoNWeb::GetPreference() {
     return GetServoPreference();
+}
+
+void ServoNWeb::SetNWebJavaScriptResultCallBack(
+    std::shared_ptr<NWebJavaScriptResultCallBack> callback) {
+    js_result_callback_ = std::move(callback);
+}
+
+void ServoNWeb::RegisterNativeValideCallback(const char* webName,
+                                             const NativeArkWebOnValidCallback callback) {
+    if (callback != nullptr && webName != nullptr) {
+        callback(webName);
+    }
+}
+
+void ServoNWeb::RegisterNativeDestroyCallback(const char* webName,
+                                              const NativeArkWebOnDestroyCallback callback) {
+    native_destroy_web_name_ = webName != nullptr ? webName : "";
+    native_destroy_callback_ = callback;
+}
+
+std::shared_ptr<NWebDragData> ServoNWeb::GetOrCreateDragData() {
+    if (!drag_data_) {
+        drag_data_ = std::make_shared<ServoDragData>();
+    }
+    return drag_data_;
+}
+
+// Servo has no JS precompile/code-cache API. The NAPI callback unconditionally reads GetInt64()
+// off the message and rejects the ArkTS promise for any non-OK (non-zero) code, so deliver an
+// INTEGER message immediately rather than leaving the promise hanging.
+void ServoNWeb::PrecompileJavaScript(const std::string& /*url*/, const std::string& /*script*/,
+                                     std::shared_ptr<CacheOptions>& /*cacheOptions*/,
+                                     std::shared_ptr<NWebMessageValueCallback> callback) {
+    if (!callback) {
+        return;
+    }
+    auto message = std::make_shared<NWebMessage>(NWebValue::Type::INTEGER);
+    message->SetInt64(-1);
+    callback->OnReceiveValue(std::move(message));
 }
 
 }  // namespace OHOS::NWeb

@@ -3,6 +3,7 @@
     "pages/Index",
     "pages/TabsPage",
     "pages/SplitPage",
-    "pages/DialogPage"
+    "pages/DialogPage",
+    "pages/ControllerPage"
   ]
 }

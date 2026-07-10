@@ -149,6 +149,28 @@ def find_center(tree: dict, text: str) -> tuple[int, int] | None:
     return found[0] if found else None
 
 
+def web_box(tree: dict) -> tuple[int, int, int, int]:
+    """Return the screen bounds (left, top, right, bottom) of the first `Web` component.
+
+    Servo's content is a GPU surface, so this is the only way to know where the web area is
+    on pages whose chrome (button grids etc.) pushes it down.
+    """
+    found: list[tuple[int, int, int, int]] = []
+
+    def walk(node: dict) -> None:
+        attributes = node.get("attributes", node)
+        if attributes.get("type") == "Web":
+            bounds = re.match(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]", attributes.get("bounds", ""))
+            if bounds:
+                found.append(tuple(int(v) for v in bounds.groups()))  # type: ignore[arg-type]
+        for child in node.get("children", []):
+            walk(child)
+
+    walk(tree)
+    assert found, "no Web component in the layout tree"
+    return found[0]
+
+
 def url_bar_text(tree: dict) -> str | None:
     """Return the text of the app's URL bar (the first `TextInput` in the ArkUI tree)."""
 
