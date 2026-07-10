@@ -80,7 +80,9 @@ Every device command is bounded by `CMD_TIMEOUT` so a wedged device fails instea
 hanging the run.
 
 APIs only reachable through `WebviewController` (e.g. `getTitle`, `pageDown`) need a
-trigger inside the app: add a button (or page) to `test-app/` that invokes the API and
-reports the result via `console.info`, then tap it via `dump_layout` and assert on the log.
+trigger inside the app: `test-app` `ControllerPage` (`launch(page="controller")`) is the
+pattern — one button per API, each reporting `ArkWebTest: <name>=<value>` to hilog, driven
+by `test_controller.py`'s `invoke()` helper. Extend that page (and `test_controller.py`)
+when wiring new controller APIs.
 
 Keep this file up to date when the tooling, harness idioms, or test-app hooks change.

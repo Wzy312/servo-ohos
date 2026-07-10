@@ -37,6 +37,9 @@ export default class EntryAbility extends UIAbility {
         if (page === 'dialog') {
           return 'pages/DialogPage';
         }
+        if (page === 'controller') {
+          return 'pages/ControllerPage';
+        }
       }
     }
     return 'pages/Index';

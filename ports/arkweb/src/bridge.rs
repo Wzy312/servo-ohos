@@ -37,12 +37,23 @@ pub mod ffi {
         fn reload(id: u32);
         fn go_back(id: u32);
         fn go_forward(id: u32);
+        /// Traverse the session history by `step` entries (negative = back, positive = forward).
+        fn navigate_back_or_forward(id: u32, step: i32);
         fn resize(id: u32, width: u32, height: u32);
         fn set_throttled(id: u32, throttled: bool);
         fn focus(id: u32);
         fn blur(id: u32);
         fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32);
         fn scroll_by(id: u32, dx: f32, dy: f32);
+        /// Scroll one viewport up/down; `to_edge` jumps to the start/end of the page instead
+        /// (`NWeb::PageUp(top)` / `PageDown(bottom)`).
+        fn page_scroll(id: u32, up: bool, to_edge: bool);
+        /// Drive the page's active media session: 0 = play, 1 = pause, 2 = stop (constants
+        /// mirrored in servo_nweb.cpp).
+        fn media_session_action(id: u32, action: i32);
+        /// Last known playback state as OHOS `MediaPlaybackState` values
+        /// (0 = NONE, 1 = PLAYING, 2 = PAUSED).
+        fn get_media_playback_state(id: u32) -> i32;
         fn set_page_zoom(id: u32, zoom: f32);
         fn evaluate_javascript(id: u32, code: &CxxString);
         fn get_url(id: u32) -> String;
@@ -193,6 +204,9 @@ fn go_back(id: u32) {
 fn go_forward(id: u32) {
     crate::runtime::go_forward(id)
 }
+fn navigate_back_or_forward(id: u32, step: i32) {
+    crate::runtime::navigate_back_or_forward(id, step)
+}
 fn resize(id: u32, width: u32, height: u32) {
     crate::runtime::resize(id, width, height)
 }
@@ -210,6 +224,15 @@ fn touch_event(id: u32, kind: u8, x: f32, y: f32, pointer_id: i32) {
 }
 fn scroll_by(id: u32, dx: f32, dy: f32) {
     crate::runtime::scroll_by(id, dx, dy)
+}
+fn page_scroll(id: u32, up: bool, to_edge: bool) {
+    crate::runtime::page_scroll(id, up, to_edge)
+}
+fn media_session_action(id: u32, action: i32) {
+    crate::runtime::media_session_action(id, action)
+}
+fn get_media_playback_state(id: u32) -> i32 {
+    crate::runtime::get_media_playback_state(id)
 }
 fn set_page_zoom(id: u32, zoom: f32) {
     crate::runtime::set_page_zoom(id, zoom)
