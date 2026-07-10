@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "arkweb-test"
+    },
+    {
+      "name": "pasteboard_reason",
+      "value": "Read the clipboard to paste into web content"
     }
   ]
 }

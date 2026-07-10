@@ -492,16 +492,26 @@ impl ServoThread {
         // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
         // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
         // is used). Both schemes go through the same CONNECT-capable proxy.
-        let mut builder = ServoBuilder::default().opts(opts).event_loop_waker(waker);
+        let mut preferences = Preferences {
+            // Expose the async Clipboard API (`navigator.clipboard`) to web content; it is
+            // off by default in Servo. Backed by the OHOS system pasteboard via the clipboard
+            // delegate. (`ClipboardEvent`/`execCommand` copy-paste is already enabled by default.)
+            dom_async_clipboard_enabled: true,
+            ..Default::default()
+        };
+        // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
+        // device typically has no direct route, so an `hdc rport` reverse-forward to a host proxy
+        // is used). Both schemes go through the same CONNECT-capable proxy.
         if !proxy.is_empty() {
             info!("[arkweb] using network proxy {proxy}");
-            builder = builder.preferences(Preferences {
-                network_http_proxy_uri: proxy.clone(),
-                network_https_proxy_uri: proxy,
-                ..Default::default()
-            });
+            preferences.network_http_proxy_uri = proxy.clone();
+            preferences.network_https_proxy_uri = proxy;
         }
-        let servo = builder.build();
+        let servo = ServoBuilder::default()
+            .opts(opts)
+            .event_loop_waker(waker)
+            .preferences(preferences)
+            .build();
         ServoThread {
             servo,
             webviews: HashMap::new(),
