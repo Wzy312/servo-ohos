@@ -77,8 +77,16 @@ void NWebHandlerProxy::on_load_error(std::int32_t code, const std::string& desc,
     }
 }
 
-// No direct NWebHandler equivalent yet; wired up in a later milestone.
-void NWebHandlerProxy::on_url_changed(const std::string& /*url*/) const {}
+// Servo fires notify_url_changed on every URL change, including history
+// traversal and history.pushState/replaceState, which do not go through a
+// fresh page load (so OnPageLoadBegin/End would not fire). OnRefreshAccessedHistory
+// is ArkWeb's navigation-committed callback (ArkTS onRefreshAccessedHistory), which
+// carries the new URL and lets the embedder keep its URL bar in sync.
+void NWebHandlerProxy::on_url_changed(const std::string& url) const {
+    if (auto h = handler()) {
+        h->OnRefreshAccessedHistory(url, false);
+    }
+}
 
 void NWebHandlerProxy::on_title_changed(const std::string& title) const {
     if (auto h = handler()) {

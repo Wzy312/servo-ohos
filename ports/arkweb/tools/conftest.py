@@ -58,7 +58,10 @@ CMD_TIMEOUT = 30.0
 
 
 def sh(device: HarmonyDevice, command: str, check: bool = True, timeout: float = CMD_TIMEOUT) -> str:
-    return device.cmd(command, capture_output=True, text=True, check=check, timeout=timeout).stdout
+    # errors="replace": the hilog buffer occasionally contains non-UTF-8 bytes (raw binary in a
+    # log line), which would otherwise crash the strict decode inside subprocess and flake any
+    # test that reads the log.
+    return device.cmd(command, capture_output=True, text=True, errors="replace", check=check, timeout=timeout).stdout
 
 
 def tap(device: HarmonyDevice, xy: tuple[int, int]) -> None:
@@ -144,6 +147,21 @@ def find_center(tree: dict, text: str) -> tuple[int, int] | None:
 
     walk(tree)
     return found[0] if found else None
+
+
+def url_bar_text(tree: dict) -> str | None:
+    """Return the text of the app's URL bar (the first `TextInput` in the ArkUI tree)."""
+
+    def walk(node: dict) -> str | None:
+        attributes = node.get("attributes", node)
+        if attributes.get("type") == "TextInput":
+            return attributes.get("text", "")
+        for child in node.get("children", []):
+            if (found := walk(child)) is not None:
+                return found
+        return None
+
+    return walk(tree)
 
 
 def screencap(device: HarmonyDevice, dest_dir: Path) -> Image.Image:
