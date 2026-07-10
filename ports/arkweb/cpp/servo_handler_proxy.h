@@ -36,6 +36,12 @@ public:
                            std::int32_t height) const override;
     bool show_file_picker(std::uint64_t picker_id, const std::string& accept_types,
                           bool multiple) const override;
+    bool show_geolocation_permission(std::uint64_t request_id,
+                                     const std::string& origin) const override;
+    bool show_permission_request(std::uint64_t request_id, const std::string& origin,
+                                 std::int32_t resources) const override;
+    bool show_http_auth_request(std::uint64_t request_id, const std::string& host,
+                                const std::string& realm) const override;
 
 private:
     std::shared_ptr<OHOS::NWeb::NWebHandler> handler() const;

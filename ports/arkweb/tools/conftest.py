@@ -22,10 +22,13 @@ xDevice, or the on-device @ohos/hypium module, once that tooling is validated he
 from __future__ import annotations
 
 import base64
+import http.server
 import json
 import os
 import re
 import shlex
+import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -330,6 +333,86 @@ def cap(device: HarmonyDevice, tmp_path: Path):
 def dump(device: HarmonyDevice, tmp_path: Path):
     """Return a zero-arg function that dumps and returns the parsed ArkUI component tree."""
     return lambda: dump_layout(device, tmp_path)
+
+
+# --- local HTTP fixture server (device-reachable via hdc reverse-forward) ----------------
+
+GEO_PAGE = """<html><head><title>geo-page</title></head>
+<body style="margin:0;background:#dddddd">
+<script>
+navigator.geolocation.getCurrentPosition(
+  function(p){document.body.style.background='#00cc00';},
+  function(e){document.body.style.background=(e.code===1)?'#cc0000':'#2244cc';});
+</script></body></html>"""
+
+AUTH_OK_PAGE = "<html><body style='margin:0;background:#00cc00'>authed</body></html>"
+
+# user:passwd -- matches the credentials ControllerPage's onHttpAuthRequest confirms with.
+AUTH_CREDENTIALS = "Basic " + base64.b64encode(b"user:passwd").decode()
+
+
+class _FixtureHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        if self.path == "/geo.html":
+            self._page(GEO_PAGE)
+        elif self.path == "/auth":
+            if self.headers.get("Authorization") == AUTH_CREDENTIALS:
+                self._page(AUTH_OK_PAGE)
+            else:
+                body = b"unauthorized"
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="servo-test"')
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def _page(self, html: str) -> None:
+        body = html.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args) -> None:  # quiet
+        pass
+
+
+@pytest.fixture(scope="session")
+def http_server(device: HarmonyDevice):
+    """Base URL of a host-side fixture server, reachable from the device at 127.0.0.1.
+
+    An `hdc rport` reverse-forward makes the host server reachable on device loopback.
+    Loopback is a *potentially trustworthy* origin (a secure context), which data: URLs are
+    not -- required for anything gated on secure contexts, e.g. permission prompts
+    (non-secure contexts are silently denied without a prompt). Also serves the Basic-auth
+    endpoint (`/auth`, credentials user/passwd) for the HTTP-auth tests.
+    """
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FixtureHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    target = Hdc().list_targets()[0]
+    forward = f"tcp:{port}"
+    result = subprocess.run(
+        ["hdc", "-t", target, "rport", forward, forward],
+        capture_output=True,
+        text=True,
+        timeout=CMD_TIMEOUT,
+    )
+    assert "OK" in result.stdout or result.returncode == 0, f"hdc rport failed: {result.stdout!r}"
+    yield f"http://127.0.0.1:{port}"
+    subprocess.run(
+        ["hdc", "-t", target, "fport", "rm", forward, forward],
+        capture_output=True,
+        text=True,
+        timeout=CMD_TIMEOUT,
+        check=False,
+    )
+    server.shutdown()
 
 
 @pytest.fixture

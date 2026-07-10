@@ -5,9 +5,12 @@
 #include <utility>
 
 #include "arkweb/src/bridge.rs.h"
+#include "ohos_nweb/nweb_access_request.h"
 #include "ohos_nweb/nweb_console_log.h"
 #include "ohos_nweb/nweb_file_selector_params.h"
+#include "ohos_nweb/nweb_geolocation_callback_interface.h"
 #include "ohos_nweb/nweb_js_dialog_result.h"
+#include "ohos_nweb/nweb_js_http_auth_result.h"
 #include "ohos_nweb/nweb_select_popup_menu.h"
 #include "ohos_nweb/nweb_value_callback.h"
 
@@ -299,6 +302,84 @@ bool NWebHandlerProxy::show_js_dialog(std::uint64_t dialog_id, std::int32_t kind
         default:
             return false;
     }
+}
+
+namespace {
+// The callback ACE / the app invokes with the geolocation decision, routed back to the parked
+// Servo PermissionRequest by id. `retain`/`incognito` have no Servo equivalent and are dropped.
+class ServoGeolocationCallback : public NWebGeolocationCallbackInterface {
+public:
+    explicit ServoGeolocationCallback(std::uint64_t request_id) : request_id_(request_id) {}
+    void GeolocationCallbackInvoke(const std::string& /*origin*/, bool allow, bool /*retain*/,
+                                   bool /*incognito*/) override {
+        servo::arkweb::resolve_permission(request_id_, allow);
+    }
+
+private:
+    std::uint64_t request_id_;
+};
+
+// The access request handed to ACE / the app for non-geolocation permission prompts
+// (camera / microphone). Agree/Refuse route back to the parked Servo PermissionRequest.
+class ServoAccessRequest : public NWebAccessRequest {
+public:
+    ServoAccessRequest(std::uint64_t request_id, std::string origin, int resources)
+        : request_id_(request_id), origin_(std::move(origin)), resources_(resources) {}
+    std::string Origin() override { return origin_; }
+    int ResourceAcessId() override { return resources_; }
+    void Agree(int /*resourceId*/) override { servo::arkweb::resolve_permission(request_id_, true); }
+    void Refuse() override { servo::arkweb::resolve_permission(request_id_, false); }
+
+private:
+    std::uint64_t request_id_;
+    std::string origin_;
+    int resources_;
+};
+
+// The result object ACE / the app invokes with HTTP-auth credentials (or cancellation), routed
+// back to the parked Servo AuthenticationRequest by id.
+class ServoHttpAuthResult : public NWebJSHttpAuthResult {
+public:
+    explicit ServoHttpAuthResult(std::uint64_t request_id) : request_id_(request_id) {}
+    bool Confirm(const std::string& userName, const std::string& pwd) override {
+        servo::arkweb::resolve_http_auth(request_id_, true, userName, pwd);
+        return true;
+    }
+    void Cancel() override { servo::arkweb::resolve_http_auth(request_id_, false, "", ""); }
+    bool IsHttpAuthInfoSaved() override { return false; }
+
+private:
+    std::uint64_t request_id_;
+};
+}  // namespace
+
+bool NWebHandlerProxy::show_geolocation_permission(std::uint64_t request_id,
+                                                   const std::string& origin) const {
+    auto h = handler();
+    if (!h) {
+        return false;
+    }
+    h->OnGeolocationShow(origin, std::make_shared<ServoGeolocationCallback>(request_id));
+    return true;
+}
+
+bool NWebHandlerProxy::show_permission_request(std::uint64_t request_id, const std::string& origin,
+                                               std::int32_t resources) const {
+    auto h = handler();
+    if (!h) {
+        return false;
+    }
+    h->OnPermissionRequest(std::make_shared<ServoAccessRequest>(request_id, origin, resources));
+    return true;
+}
+
+bool NWebHandlerProxy::show_http_auth_request(std::uint64_t request_id, const std::string& host,
+                                              const std::string& realm) const {
+    auto h = handler();
+    if (!h) {
+        return false;
+    }
+    return h->OnHttpAuthRequestByJS(std::make_shared<ServoHttpAuthResult>(request_id), host, realm);
 }
 
 }  // namespace servo::arkweb

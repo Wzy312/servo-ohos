@@ -33,13 +33,14 @@ use raw_window_handle::{
     WindowHandle,
 };
 use servo::{
-    CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource, DevicePoint, DeviceVector2D,
-    EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker, ImeEvent, InputEvent,
-    InputMethodControl, InputMethodType, JSValue, Key, KeyState, KeyboardEvent, LoadStatus,
-    MediaSessionActionType, MediaSessionEvent, NamedKey, Opts, Preferences, RefreshDriver,
-    RenderingContext, Scroll, SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder,
-    SimpleDialog, TouchEvent, TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder,
-    WebViewDelegate, WindowRenderingContext,
+    AuthenticationRequest, CompositionEvent, CompositionState, ConsoleLogLevel, CookieSource,
+    DevicePoint, DeviceVector2D, EmbedderControl, EmbedderControlId, EventLoopWaker, FilePicker,
+    ImeEvent, InputEvent, InputMethodControl, InputMethodType, JSValue, Key, KeyState,
+    KeyboardEvent, LoadStatus, MediaSessionActionType, MediaSessionEvent, NamedKey, Opts,
+    PermissionFeature, PermissionRequest, Preferences, RefreshDriver, RenderingContext, Scroll,
+    SelectElement, SelectElementOptionOrOptgroup, Servo, ServoBuilder, SimpleDialog, TouchEvent,
+    TouchEventType, TouchId, TouchPointerType, WebView, WebViewBuilder, WebViewDelegate,
+    WindowRenderingContext,
 };
 use url::Url;
 
@@ -187,6 +188,18 @@ enum Action {
         paths: Vec<String>,
         cancelled: bool,
     },
+    /// A permission decision from ACE (geolocation callback or access-request object).
+    ResolvePermission {
+        request_id: u64,
+        allow: bool,
+    },
+    /// HTTP-auth credentials (or cancellation) from ACE.
+    ResolveHttpAuth {
+        request_id: u64,
+        confirmed: bool,
+        username: String,
+        password: String,
+    },
     GetCookie {
         url: String,
         include_http_only: bool,
@@ -311,6 +324,48 @@ fn resolve_file_picker(picker_id: u64, paths: Vec<String>, cancelled: bool) {
                 let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
                 picker.select(&paths);
                 picker.submit();
+            }
+        }
+    });
+}
+
+static NEXT_PERMISSION_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// Permission prompts (geolocation, camera/microphone) awaiting a decision. Like the other
+    /// `!Send` embedder requests, the `PermissionRequest` is parked on the servo thread; ACE (or
+    /// the app's permission handler) reports the decision through the geolocation callback /
+    /// access-request object, routed back as an `Action`.
+    static PERMISSION_REQUESTS: RefCell<HashMap<u64, PermissionRequest>> =
+        RefCell::new(HashMap::new());
+}
+
+fn resolve_parked_permission(request_id: u64, allow: bool) {
+    PERMISSION_REQUESTS.with(|requests| {
+        if let Some(request) = requests.borrow_mut().remove(&request_id) {
+            if allow {
+                request.allow();
+            } else {
+                request.deny();
+            }
+        }
+    });
+}
+
+static NEXT_AUTH_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// HTTP-auth requests awaiting credentials. Dropping a parked request responds "no
+    /// credentials" (the load proceeds to the error/401 page), which is also the cancel path.
+    static AUTH_REQUESTS: RefCell<HashMap<u64, AuthenticationRequest>> =
+        RefCell::new(HashMap::new());
+}
+
+fn resolve_parked_http_auth(request_id: u64, confirmed: bool, username: String, password: String) {
+    AUTH_REQUESTS.with(|requests| {
+        if let Some(request) = requests.borrow_mut().remove(&request_id) {
+            if confirmed {
+                request.authenticate(username, password);
             }
         }
     });
@@ -515,6 +570,9 @@ impl ServoThread {
             // off by default in Servo. Backed by the OHOS system pasteboard via the clipboard
             // delegate. (`ClipboardEvent`/`execCommand` copy-paste is already enabled by default.)
             dom_async_clipboard_enabled: true,
+            // Expose `navigator.geolocation` so the ArkWeb geolocation permission flow
+            // (onGeolocationShow) is reachable; off by default in Servo.
+            dom_geolocation_enabled: true,
             ..Default::default()
         };
         // Route networking through an HTTP(S) proxy when one is configured (dev/testing aid; the
@@ -801,6 +859,15 @@ impl ServoThread {
                 paths,
                 cancelled,
             } => resolve_file_picker(picker_id, paths, cancelled),
+            Action::ResolvePermission { request_id, allow } => {
+                resolve_parked_permission(request_id, allow)
+            },
+            Action::ResolveHttpAuth {
+                request_id,
+                confirmed,
+                username,
+                password,
+            } => resolve_parked_http_auth(request_id, confirmed, username, password),
             Action::GetCookie {
                 url,
                 include_http_only,
@@ -1169,6 +1236,62 @@ impl WebViewDelegate for ArkWebViewDelegate {
         self.sync.can_fwd.store(can_fwd, Ordering::Relaxed);
         if let Some(client) = self.client.as_ref() {
             client.on_history_changed(can_back, can_fwd);
+        }
+    }
+
+    fn request_permission(&self, webview: WebView, request: PermissionRequest) {
+        // ArkWeb splits permission prompts: geolocation goes through the dedicated
+        // onGeolocationShow event, camera/microphone through onPermissionRequest (an
+        // NWebAccessRequest resource bitmask). Other features have no ArkWeb prompt; dropping
+        // the request sends Servo's default response.
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let feature = request.feature();
+        let origin = webview
+            .url()
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        let request_id = NEXT_PERMISSION_ID.fetch_add(1, Ordering::Relaxed);
+        cxx::let_cxx_string!(origin_cxx = &origin);
+        let shown = match feature {
+            PermissionFeature::Geolocation => {
+                PERMISSION_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
+                client.show_geolocation_permission(request_id, &origin_cxx)
+            },
+            PermissionFeature::Camera | PermissionFeature::Microphone => {
+                let resources = if matches!(feature, PermissionFeature::Camera) {
+                    1 << 1
+                } else {
+                    1 << 2
+                };
+                PERMISSION_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
+                client.show_permission_request(request_id, &origin_cxx, resources)
+            },
+            feature => {
+                info!("[arkweb] no ArkWeb prompt for permission {feature:?}; default response");
+                return;
+            },
+        };
+        if !shown {
+            resolve_parked_permission(request_id, false);
+        }
+    }
+
+    fn request_authentication(&self, _webview: WebView, request: AuthenticationRequest) {
+        // Dropping the request responds "no credentials", so bailing out (no client / no ArkTS
+        // handler) lets the load continue to the 401 page rather than hanging.
+        let Some(client) = self.client.as_ref() else {
+            return;
+        };
+        let host = request.url().host_str().unwrap_or_default().to_owned();
+        let request_id = NEXT_AUTH_ID.fetch_add(1, Ordering::Relaxed);
+        AUTH_REQUESTS.with(|r| r.borrow_mut().insert(request_id, request));
+        cxx::let_cxx_string!(host_cxx = &host);
+        // Servo does not surface the authentication realm (or proxy-ness) to the embedder.
+        cxx::let_cxx_string!(realm_cxx = "");
+        if !client.show_http_auth_request(request_id, &host_cxx, &realm_cxx) {
+            resolve_parked_http_auth(request_id, false, String::new(), String::new());
         }
     }
 
@@ -1670,6 +1793,28 @@ pub fn resolve_js_dialog(dialog_id: u64, confirmed: bool, value: &CxxString) {
             dialog_id,
             confirmed,
             value: value.to_string(),
+        })
+    })
+}
+
+pub fn resolve_permission(request_id: u64, allow: bool) {
+    guard("resolve_permission", || {
+        send(Action::ResolvePermission { request_id, allow })
+    })
+}
+
+pub fn resolve_http_auth(
+    request_id: u64,
+    confirmed: bool,
+    username: &CxxString,
+    password: &CxxString,
+) {
+    guard("resolve_http_auth", || {
+        send(Action::ResolveHttpAuth {
+            request_id,
+            confirmed,
+            username: username.to_string(),
+            password: password.to_string(),
         })
     })
 }

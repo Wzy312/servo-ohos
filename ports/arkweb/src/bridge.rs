@@ -130,6 +130,30 @@ pub mod ffi {
             accept_types: &CxxString,
             multiple: bool,
         ) -> bool;
+        /// Ask ACE to show a geolocation permission prompt for `origin`. Returns whether a
+        /// handler took it; the decision comes back via `resolve_permission`.
+        fn show_geolocation_permission(
+            self: &WebViewClient,
+            request_id: u64,
+            origin: &CxxString,
+        ) -> bool;
+        /// Ask ACE to show a permission prompt for the `NWebAccessRequest` resource bitmask
+        /// (1<<1 video capture, 1<<2 audio capture). The decision comes back via
+        /// `resolve_permission`.
+        fn show_permission_request(
+            self: &WebViewClient,
+            request_id: u64,
+            origin: &CxxString,
+            resources: i32,
+        ) -> bool;
+        /// Ask ACE to show an HTTP-auth login prompt. Credentials come back via
+        /// `resolve_http_auth`.
+        fn show_http_auth_request(
+            self: &WebViewClient,
+            request_id: u64,
+            host: &CxxString,
+            realm: &CxxString,
+        ) -> bool;
     }
 }
 
@@ -154,6 +178,18 @@ pub mod ffi_arkweb {
         fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>);
         /// The file picker was dismissed without a selection.
         fn file_picker_cancel(picker_id: u64);
+        /// Deliver a permission decision from ACE back to the parked `PermissionRequest`
+        /// (geolocation and access-request prompts alike, see `show_geolocation_permission` /
+        /// `show_permission_request`).
+        fn resolve_permission(request_id: u64, allow: bool);
+        /// Deliver HTTP-auth credentials (or cancellation) from ACE back to the parked
+        /// `AuthenticationRequest` (see `show_http_auth_request`).
+        fn resolve_http_auth(
+            request_id: u64,
+            confirmed: bool,
+            username: &CxxString,
+            password: &CxxString,
+        );
     }
 
     unsafe extern "C++" {
@@ -290,4 +326,10 @@ fn file_picker_continue(picker_id: u64, paths: &CxxVector<CxxString>) {
 }
 fn file_picker_cancel(picker_id: u64) {
     crate::runtime::file_picker_cancel(picker_id)
+}
+fn resolve_permission(request_id: u64, allow: bool) {
+    crate::runtime::resolve_permission(request_id, allow)
+}
+fn resolve_http_auth(request_id: u64, confirmed: bool, username: &CxxString, password: &CxxString) {
+    crate::runtime::resolve_http_auth(request_id, confirmed, username, password)
 }
