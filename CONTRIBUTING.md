@@ -20,6 +20,13 @@ The rules in this fork are roughly:
 - Each commit should have a `Validation: Test by doing XYZ` comment in the commit message, explaining which tests are relevant to ensure the commit
   continues working as intended during rebasing.
 - The CI matrix is reduced (linux + ohos) to limit overhead, but try to not break other platforms. If regressions are discovered for other platforms, the patch should be fixed.
+- AI assissted contributions, are allowed in this fork but must follow these rules:
+  - Must be disclosed with an `AI-assissted` trailer in the commit message, and further information on how AI was used.
+  - This mainly targets code generation, local usage to do research or review (without modifying) does not require disclosure.
+  - The author remains responsible for their patch. Don't submit patches you don't understand.
+  - Low quality PRs may be rejected and closed.
+  - The PR description, PR comments and any discussion with reviewers must be fully written by a human. Respect the reviewers time.
+    Any AI generated prose must be clearly marked as such, and there is no expectation that a reviewer will read it.
 - Otherwise, this is very much an experiment, so expect changes.
 
 
