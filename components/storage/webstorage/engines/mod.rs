@@ -4,7 +4,18 @@
 
 use crate::webstorage::OriginEntry;
 
+#[cfg(ohos_rdb)]
+mod ohos_rdb;
+
+#[cfg(ohos_rdb)]
+pub(crate) use ohos_rdb::OhosRdbEngine as ActiveWebStorageEngine;
+
+#[cfg(not(ohos_rdb))]
 pub mod sqlite;
+
+#[cfg(not(ohos_rdb))]
+#[allow(unused_imports)]
+pub(crate) use sqlite::SqliteEngine as ActiveWebStorageEngine;
 
 pub trait WebStorageEngine {
     type Error;

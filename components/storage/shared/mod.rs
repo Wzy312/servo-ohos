@@ -2,9 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#[cfg(not(ohos_rdb))]
 use std::error::Error as StdError;
 
+#[cfg(not(ohos_rdb))]
 use libc::ENOSPC;
+#[cfg(not(ohos_rdb))]
 use rusqlite::{Error as RusqliteError, ffi};
 
 // These pragmas need to be set once
@@ -12,6 +15,7 @@ pub const DB_INIT_PRAGMAS: [&str; 2] =
     ["PRAGMA journal_mode = WAL;", "PRAGMA encoding = 'UTF-16';"];
 
 // These pragmas need to be set once for in memory databases
+#[cfg(not(target_env = "ohos"))]
 pub const DB_IN_MEMORY_INIT_PRAGMAS: [&str; 1] = ["PRAGMA encoding = 'UTF-16';"];
 
 // These pragmas need to be run once per connection.
@@ -23,8 +27,10 @@ pub const DB_PRAGMAS: [&str; 4] = [
 ];
 
 // These pragmas need to be run once per connection for in memory databases.
+#[cfg(not(target_env = "ohos"))]
 pub const DB_IN_MEMORY_PRAGMAS: [&str; 1] = ["PRAGMA cache_size = 2000;"];
 
+#[cfg(not(ohos_rdb))]
 pub(crate) fn is_sqlite_disk_full_error(error: &RusqliteError) -> bool {
     fn has_enospc(mut source: Option<&(dyn StdError + 'static)>) -> bool {
         while let Some(err) = source {

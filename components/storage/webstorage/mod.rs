@@ -29,8 +29,9 @@ use servo_url::{ImmutableOrigin, ServoUrl};
 use storage_traits::webstorage_thread::{OriginDescriptor, WebStorageThreadMsg, WebStorageType};
 use uuid::Uuid;
 
-use crate::webstorage::engines::WebStorageEngine;
-use crate::webstorage::engines::sqlite::SqliteEngine;
+use crate::webstorage::engines::{ActiveWebStorageEngine, WebStorageEngine};
+
+type LocalStorageError = <ActiveWebStorageEngine as WebStorageEngine>::Error;
 
 const QUOTA_SIZE_LIMIT: usize = 5 * 1024 * 1024;
 
@@ -168,6 +169,8 @@ impl OriginEntry {
 struct WebStorageEnvironment<E: WebStorageEngine> {
     engine: E,
     data: OriginEntry,
+    #[cfg(ohos_rdb)]
+    load_failed: bool,
 }
 
 impl<E: WebStorageEngine> MallocSizeOf for WebStorageEnvironment<E> {
@@ -176,6 +179,7 @@ impl<E: WebStorageEngine> MallocSizeOf for WebStorageEnvironment<E> {
     }
 }
 
+#[cfg(not(ohos_rdb))]
 impl<E: WebStorageEngine> WebStorageEnvironment<E> {
     fn new(engine: E) -> Self {
         WebStorageEnvironment {
@@ -198,8 +202,44 @@ impl<E: WebStorageEngine> WebStorageEnvironment<E> {
     }
 }
 
+#[cfg(ohos_rdb)]
+impl<E: WebStorageEngine> WebStorageEnvironment<E> {
+    fn new(engine: E) -> Self {
+        let (data, load_failed) = match engine.load() {
+            Ok(data) => (data, false),
+            Err(_) => {
+                warn!("Failed to load webstorage data; treating the store as read only");
+                (Default::default(), true)
+            },
+        };
+        WebStorageEnvironment {
+            data,
+            engine,
+            load_failed,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        let _ = self.engine.clear();
+    }
+
+    fn delete(&mut self, key: &str) {
+        let _ = self.engine.delete(key);
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        let _ = self.engine.set(key, value);
+    }
+}
+
 impl<E: WebStorageEngine> Drop for WebStorageEnvironment<E> {
     fn drop(&mut self) {
+        #[cfg(ohos_rdb)]
+        if self.load_failed {
+            warn!("Skipping webstorage save; the initial load failed and saving would overwrite the store");
+            return;
+        }
         self.engine.save(&self.data);
     }
 }
@@ -211,7 +251,7 @@ struct WebStorageManager {
     session_data: FxHashMap<WebViewId, FxHashMap<ImmutableOrigin, OriginEntry>>,
     config_dir: Option<PathBuf>,
     thread_pool: Arc<ThreadPool>,
-    environments: FxHashMap<ImmutableOrigin, WebStorageEnvironment<SqliteEngine>>,
+    environments: FxHashMap<ImmutableOrigin, WebStorageEnvironment<ActiveWebStorageEngine>>,
 }
 
 impl WebStorageManager {
@@ -336,10 +376,21 @@ impl WebStorageManager {
         }
     }
 
-    fn add_new_environment(&mut self, origin: &ImmutableOrigin) -> Result<(), rusqlite::Error> {
+    #[cfg(not(ohos_rdb))]
+    fn add_new_environment(&mut self, origin: &ImmutableOrigin) -> Result<(), LocalStorageError> {
         let origin_location = self.get_origin_location(origin);
 
-        let engine = SqliteEngine::new(&origin_location, self.thread_pool.clone())?;
+        let engine = ActiveWebStorageEngine::new(&origin_location, self.thread_pool.clone())?;
+        let environment = WebStorageEnvironment::new(engine);
+        self.environments.insert(origin.clone(), environment);
+        Ok(())
+    }
+
+    #[cfg(ohos_rdb)]
+    fn add_new_environment(&mut self, origin: &ImmutableOrigin) -> Result<(), LocalStorageError> {
+        let origin_location = self.get_origin_location(origin);
+
+        let engine = ActiveWebStorageEngine::new(&origin_location, self.thread_pool.clone())?;
         let environment = WebStorageEnvironment::new(engine);
         self.environments.insert(origin.clone(), environment);
         Ok(())
@@ -348,7 +399,7 @@ impl WebStorageManager {
     fn get_environment(
         &mut self,
         origin: &ImmutableOrigin,
-    ) -> Result<&WebStorageEnvironment<SqliteEngine>, rusqlite::Error> {
+    ) -> Result<&WebStorageEnvironment<ActiveWebStorageEngine>, LocalStorageError> {
         if self.environments.contains_key(origin) {
             return Ok(self
                 .environments
@@ -367,7 +418,7 @@ impl WebStorageManager {
     fn get_environment_mut(
         &mut self,
         origin: &ImmutableOrigin,
-    ) -> Result<&mut WebStorageEnvironment<SqliteEngine>, rusqlite::Error> {
+    ) -> Result<&mut WebStorageEnvironment<ActiveWebStorageEngine>, LocalStorageError> {
         if self.environments.contains_key(origin) {
             return Ok(self
                 .environments
@@ -678,5 +729,53 @@ impl WebStorageManager {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::webstorage::engines::WebStorageEngine;
+
+    struct FailingEngine;
+
+    impl WebStorageEngine for FailingEngine {
+        type Error = &'static str;
+
+        fn load(&self) -> Result<OriginEntry, Self::Error> {
+            Ok(OriginEntry::default())
+        }
+
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            Err("clear")
+        }
+
+        fn delete(&mut self, _key: &str) -> Result<(), Self::Error> {
+            Err("delete")
+        }
+
+        fn set(&mut self, _key: &str, _value: &str) -> Result<(), Self::Error> {
+            Err("set")
+        }
+
+        fn save(&mut self, _data: &OriginEntry) {}
+    }
+
+    #[test]
+    fn environment_methods_apply_operations() {
+        // The host path keeps the upstream form; on OHOS a failed load marks the
+        // environment read only so drop does not overwrite the store.
+        let mut env = WebStorageEnvironment {
+            engine: FailingEngine,
+            data: OriginEntry::default(),
+            #[cfg(ohos_rdb)]
+            load_failed: false,
+        };
+
+        env.set("key", "value");
+        env.delete("key");
+        env.clear();
+
+        assert!(env.data.inner().is_empty());
     }
 }

@@ -2,6 +2,19 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+#[cfg(ohos_no_backend)]
+compile_error!(
+    "OHOS storage requires feature `ohos-rdb-backend`; rerun with `./mach build --ohos --features ohos-rdb-backend`"
+);
+
+#[cfg(ohos_rdb)]
+pub(crate) mod blob_text;
+#[cfg(ohos_rdb)]
+pub(crate) mod client_storage_shared;
+
+#[cfg(ohos_rdb)]
+mod ohos_rdb;
+
 pub mod client_storage;
 mod indexeddb;
 pub(crate) mod shared;

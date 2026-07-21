@@ -61,6 +61,7 @@ tracing = [
     "net/tracing",
 ]
 vello = ["servo-constellation/vello"]
+ohos-rdb-backend = ["storage/ohos-rdb-backend"]
 webgl_backtrace = [
     "script/webgl_backtrace",
     "webgl/webgl_backtrace",

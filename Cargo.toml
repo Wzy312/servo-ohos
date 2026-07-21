@@ -180,6 +180,7 @@ ohos-deviceinfo-sys = "0.1.7"
 ohos-ime = "0.4.2"
 ohos-ime-sys = "0.2.4"
 ohos-media-sys = "0.1.1"
+ohos-rdb-sys = "0.1.0"
 # Local during development; switch to a published crates.io version before upstreaming.
 ohos-pasteboard = { path = "../../../ohos-pasteboard/ohos-pasteboard" }
 ohos-sys-opaque-types = "0.1.7"

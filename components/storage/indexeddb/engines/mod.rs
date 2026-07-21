@@ -10,8 +10,26 @@ use storage_traits::indexeddb::{
     AsyncOperation, CreateObjectResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
 };
 
-pub use self::sqlite::SqliteEngine;
+#[cfg(ohos_rdb)]
+mod ohos_rdb;
 
+#[path = "sqlite/encoding.rs"]
+pub(crate) mod encoding;
+
+#[cfg(ohos_rdb)]
+pub(crate) mod shared;
+
+// On OHOS builds the RDB engine takes over the SqliteEngine name so call
+// sites in pre-existing files stay untouched; the twin selection is spelled
+// out only at the engine construction site in indexeddb/mod.rs.
+#[cfg(ohos_rdb)]
+pub(crate) use ohos_rdb::OhosRdbEngine as SqliteEngine;
+
+#[cfg(not(ohos_rdb))]
+#[allow(unused_imports)]
+pub(crate) use self::sqlite::SqliteEngine;
+
+#[cfg(not(ohos_rdb))]
 mod sqlite;
 
 #[derive(MallocSizeOf)]
