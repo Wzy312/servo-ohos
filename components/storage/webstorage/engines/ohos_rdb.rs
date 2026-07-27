@@ -158,7 +158,7 @@ mod tests {
         let engine = OhosRdbEngine::new(&Some(tmp_dir.path().to_path_buf()), ThreadPool::global())
             .unwrap();
 
-        assert!(tmp_dir.path().join(STORAGE_FILE_NAME).exists());
+        assert!(tmp_dir.path().join("rdb").join(STORAGE_FILE_NAME).exists());
         drop(engine);
     }
 }

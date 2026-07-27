@@ -85,7 +85,9 @@ struct IndexedDbTestContext {
 impl IndexedDbTestContext {
     fn new() -> Self {
         install_test_namespace();
-        let test_lock = indexeddb_test_lock().lock().unwrap();
+        let test_lock = indexeddb_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let config_dir = temp_dir.path().to_path_buf();
         let client_handle: storage_traits::client_storage::ClientStorageThreadHandle =
@@ -365,7 +367,19 @@ fn put_item(
     key: IndexedDBKeyType,
     value: Vec<u8>,
 ) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
-    let request_id = 1;
+    put_item_request(ctx, db_name, store_name, txn, 1, Some(key), value, true)
+}
+
+fn put_item_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store_name: &str,
+    txn: u64,
+    request_id: u64,
+    key: Option<IndexedDBKeyType>,
+    value: Vec<u8>,
+    should_overwrite: bool,
+) -> mpsc::Receiver<Option<BackendResult<PutItemResult>>> {
     let (sender, receiver) = make_profile_callback();
     GenericSend::send(
         &ctx.private_threads,
@@ -378,10 +392,39 @@ fn put_item(
             IndexedDBTxnMode::Readwrite,
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::PutItem {
                 callback: sender,
-                key: Some(key),
+                key,
                 value,
-                should_overwrite: true,
+                should_overwrite,
                 key_generator_current_number: None,
+            }),
+        ),
+    )
+    .unwrap();
+    receiver
+}
+
+fn get_all_keys_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store_name: &str,
+    txn: u64,
+    key_range: IndexedDBKeyRange,
+    request_id: u64,
+) -> mpsc::Receiver<Option<BackendResult<Vec<IndexedDBKeyType>>>> {
+    let (sender, receiver) = make_profile_callback();
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Async(
+            ctx.origin.clone(),
+            db_name.to_string(),
+            store_name.to_string(),
+            txn,
+            request_id,
+            IndexedDBTxnMode::Readonly,
+            AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetAllKeys {
+                callback: sender,
+                key_range,
+                count: None,
             }),
         ),
     )
@@ -438,6 +481,34 @@ fn remove_item(
             AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
                 callback: sender,
                 key_range: IndexedDBKeyRange::only(key),
+            }),
+        ),
+    )
+    .unwrap();
+    receiver
+}
+
+fn remove_item_request(
+    ctx: &IndexedDbTestContext,
+    db_name: &str,
+    store_name: &str,
+    txn: u64,
+    key_range: IndexedDBKeyRange,
+) -> mpsc::Receiver<Option<BackendResult<()>>> {
+    let request_id = 1;
+    let (sender, receiver) = make_profile_callback();
+    GenericSend::send(
+        &ctx.private_threads,
+        IndexedDBThreadMsg::Async(
+            ctx.origin.clone(),
+            db_name.to_string(),
+            store_name.to_string(),
+            txn,
+            request_id,
+            IndexedDBTxnMode::Readwrite,
+            AsyncOperation::ReadWrite(AsyncReadWriteOperation::RemoveItem {
+                callback: sender,
+                key_range,
             }),
         ),
     )
@@ -952,6 +1023,351 @@ fn test_indexeddb_aborted_upgrade_reverts_version_and_stores() {
     let commit_msg = recv_callback_timeout(&commit_result, "commit reply");
     assert_eq!(lookup_msg, Some(b"Moby Dick".to_vec()));
     assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+#[test]
+fn test_indexeddb_cross_type_key_sort_order() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-sort-order";
+    let store_name = "items";
+    let connection_id =
+        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let mut receivers = Vec::new();
+    for (request_id, key, value) in [
+        (1, IndexedDBKeyType::Number(1.0), b"number".to_vec()),
+        (2, IndexedDBKeyType::Date(1.0), b"date".to_vec()),
+        (
+            3,
+            IndexedDBKeyType::String("1".to_string()),
+            b"string".to_vec(),
+        ),
+        (4, IndexedDBKeyType::Binary(vec![1]), b"binary".to_vec()),
+        (
+            5,
+            IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(1.0)]),
+            b"array".to_vec(),
+        ),
+    ] {
+        receivers.push((
+            request_id,
+            put_item_request(
+                &ctx,
+                db_name,
+                store_name,
+                txn,
+                request_id,
+                Some(key),
+                value,
+                true,
+            ),
+        ));
+    }
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    for (request_id, receiver) in receivers {
+        let result = recv_callback_timeout(&receiver, "sorted put reply");
+        assert!(result.is_ok(), "request {request_id} should succeed");
+        mark_request_handled(&ctx, db_name, txn, request_id);
+    }
+    let commit_msg = recv_callback_timeout(&commit_result, "sorted commit reply");
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readonly,
+        vec![store_name.to_string()],
+    );
+    let keys = get_all_keys_request(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        IndexedDBKeyRange::default(),
+        1,
+    );
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    let keys = recv_callback_timeout(&keys, "sorted keys reply").unwrap();
+    mark_request_handled(&ctx, db_name, txn, 1);
+    let commit_msg = recv_callback_timeout(&commit_result, "sorted read commit reply");
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    assert_eq!(
+        keys,
+        vec![
+            IndexedDBKeyType::Number(1.0),
+            IndexedDBKeyType::Date(1.0),
+            IndexedDBKeyType::String("1".to_string()),
+            IndexedDBKeyType::Binary(vec![1]),
+            IndexedDBKeyType::Array(vec![IndexedDBKeyType::Number(1.0)]),
+        ]
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+#[test]
+fn test_indexeddb_delete_item_range_respects_open_bounds() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-open-bounds";
+    let store_name = "items";
+    let connection_id =
+        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
+
+    fn remaining_keys_after_delete(
+        ctx: &IndexedDbTestContext,
+        db_name: &str,
+        store_name: &str,
+        lower: i32,
+        upper: i32,
+        lower_open: bool,
+        upper_open: bool,
+    ) -> Vec<i32> {
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            IndexedDBTxnMode::Readwrite,
+            vec![store_name.to_string()],
+        );
+        let mut receivers = Vec::new();
+        for key in 1..=10 {
+            receivers.push((
+                key,
+                put_item_request(
+                    ctx,
+                    db_name,
+                    store_name,
+                    txn,
+                    key as u64,
+                    Some(IndexedDBKeyType::Number(key as f64)),
+                    vec![key as u8],
+                    true,
+                ),
+            ));
+        }
+        let commit_result = commit_transaction(ctx, db_name, txn);
+        for (request_id, receiver) in receivers {
+            let result = recv_callback_timeout(&receiver, "seed put reply");
+            assert!(result.is_ok(), "seed request {request_id} should succeed");
+            mark_request_handled(ctx, db_name, txn, request_id as u64);
+        }
+        let commit_msg = recv_callback_timeout(&commit_result, "seed commit reply");
+        assert!(commit_msg.result.is_ok());
+        finish_transaction(ctx, db_name, txn);
+
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            IndexedDBTxnMode::Readwrite,
+            vec![store_name.to_string()],
+        );
+        let delete = remove_item_request(
+            ctx,
+            db_name,
+            store_name,
+            txn,
+            IndexedDBKeyRange::new(
+                Some(IndexedDBKeyType::Number(lower as f64)),
+                Some(IndexedDBKeyType::Number(upper as f64)),
+                lower_open,
+                upper_open,
+            ),
+        );
+        let commit_result = commit_transaction(ctx, db_name, txn);
+        let delete_msg = recv_callback_timeout(&delete, "range delete reply");
+        assert!(delete_msg.is_ok());
+        mark_request_handled(ctx, db_name, txn, 1);
+        let commit_msg = recv_callback_timeout(&commit_result, "range delete commit reply");
+        assert!(commit_msg.result.is_ok());
+        finish_transaction(ctx, db_name, txn);
+
+        let txn = create_transaction(
+            ctx,
+            db_name,
+            IndexedDBTxnMode::Readonly,
+            vec![store_name.to_string()],
+        );
+        let keys = get_all_keys_request(
+            ctx,
+            db_name,
+            store_name,
+            txn,
+            IndexedDBKeyRange::default(),
+            1,
+        );
+        let commit_result = commit_transaction(ctx, db_name, txn);
+        let keys = recv_callback_timeout(&keys, "remaining keys reply").unwrap();
+        mark_request_handled(ctx, db_name, txn, 1);
+        let commit_msg = recv_callback_timeout(&commit_result, "remaining keys commit reply");
+        assert!(commit_msg.result.is_ok());
+        finish_transaction(ctx, db_name, txn);
+
+        keys.into_iter()
+            .map(|key| match key {
+                IndexedDBKeyType::Number(number) => number as i32,
+                other => panic!("Expected numeric key, got {other:?}"),
+            })
+            .collect()
+    }
+
+    assert_eq!(
+        remaining_keys_after_delete(&ctx, db_name, store_name, 3, 8, false, false),
+        vec![1, 2, 9, 10]
+    );
+    assert_eq!(
+        remaining_keys_after_delete(&ctx, db_name, store_name, 3, 8, true, false),
+        vec![1, 2, 3, 9, 10]
+    );
+    assert_eq!(
+        remaining_keys_after_delete(&ctx, db_name, store_name, 3, 8, false, true),
+        vec![1, 2, 8, 9, 10]
+    );
+    assert_eq!(
+        remaining_keys_after_delete(&ctx, db_name, store_name, 3, 8, true, true),
+        vec![1, 2, 3, 8, 9, 10]
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+#[test]
+fn test_indexeddb_auto_increment_assigns_sequential_keys() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-auto-increment";
+    let store_name = "items";
+
+    let receiver = open_database(&ctx, db_name, Some(1));
+    let connection_id = loop {
+        match recv_callback_timeout(&receiver, "auto-increment open reply") {
+            ConnectionMsg::Upgrade { transaction, .. } => {
+                assert_eq!(
+                    create_object_store(&ctx, db_name, store_name, None, true),
+                    CreateObjectResult::Created
+                );
+                finish_upgrade_transaction(&ctx, transaction, db_name, true);
+                finish_transaction(&ctx, db_name, transaction);
+            },
+            ConnectionMsg::Connection { id, upgraded, .. } => {
+                assert!(upgraded);
+                break id;
+            },
+            other => panic!("unexpected auto-increment message: {other:?}"),
+        }
+    };
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let first = put_item_request(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        1,
+        None,
+        b"first".to_vec(),
+        true,
+    );
+    let second = put_item_request(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        2,
+        None,
+        b"second".to_vec(),
+        true,
+    );
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    let first_msg = recv_callback_timeout(&first, "first auto-increment put reply").unwrap();
+    let second_msg = recv_callback_timeout(&second, "second auto-increment put reply").unwrap();
+    mark_request_handled(&ctx, db_name, txn, 1);
+    mark_request_handled(&ctx, db_name, txn, 2);
+    let commit_msg = recv_callback_timeout(&commit_result, "auto-increment commit reply");
+    assert_eq!(first_msg, PutItemResult::Key(IndexedDBKeyType::Number(1.0)));
+    assert_eq!(
+        second_msg,
+        PutItemResult::Key(IndexedDBKeyType::Number(2.0))
+    );
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readonly,
+        vec![store_name.to_string()],
+    );
+    let keys = get_all_keys_request(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        IndexedDBKeyRange::default(),
+        1,
+    );
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    let keys = recv_callback_timeout(&keys, "auto-increment keys reply").unwrap();
+    mark_request_handled(&ctx, db_name, txn, 1);
+    let commit_msg = recv_callback_timeout(&commit_result, "auto-increment read commit reply");
+    assert!(commit_msg.result.is_ok());
+    finish_transaction(&ctx, db_name, txn);
+
+    assert_eq!(
+        keys,
+        vec![IndexedDBKeyType::Number(1.0), IndexedDBKeyType::Number(2.0),]
+    );
+
+    close_database(&ctx, connection_id, db_name);
+    ctx.shutdown();
+}
+
+#[test]
+fn test_indexeddb_batch_commit_failure_surfaces_an_error() {
+    let ctx = IndexedDbTestContext::new();
+    let db_name = "indexeddb-batch-failure";
+    let store_name = "items";
+    let connection_id =
+        expect_upgrade_and_initialize_database(&ctx, db_name, store_name, "by_author", None);
+
+    let txn = create_transaction(
+        &ctx,
+        db_name,
+        IndexedDBTxnMode::Readwrite,
+        vec![store_name.to_string()],
+    );
+    let failing = put_item_request(
+        &ctx,
+        db_name,
+        store_name,
+        txn,
+        1,
+        None,
+        b"missing key".to_vec(),
+        true,
+    );
+    let commit_result = commit_transaction(&ctx, db_name, txn);
+    let failing_msg = recv_callback_timeout(&failing, "missing key batch put reply");
+    assert!(failing_msg.is_err());
+    mark_request_handled(&ctx, db_name, txn, 1);
+    let _ = recv_callback_timeout(&commit_result, "batch commit reply");
     finish_transaction(&ctx, db_name, txn);
 
     close_database(&ctx, connection_id, db_name);

@@ -273,6 +273,12 @@ impl RegistryEngine for OhosRdbEngine {
         .map_err(ClientStorageErrorr::Internal)?;
 
         tx.execute(
+            "DELETE FROM directories WHERE database_id = ?1;",
+            &path_args,
+        )
+        .map_err(ClientStorageErrorr::Internal)?;
+
+        tx.execute(
             "DELETE FROM databases WHERE bottle_id = ?1 AND name = ?2;",
             &lookup_args,
         )
@@ -478,6 +484,7 @@ mod tests {
             .path()
             .join("clientstorage")
             .join("default_v1")
+            .join("rdb")
             .join(REGISTRY_FILE_NAME)
     }
 

@@ -374,8 +374,15 @@ impl KvsEngine for OhosRdbEngine {
             // that never became durable; if the commit fails, the whole batch
             // reports Err (matching IndexedDB all-or-nothing transaction
             // semantics).
+            // A write whose execution fails (its statements may have partially
+            // run) aborts the whole batch: the native transaction is rolled
+            // back and every queued callback reports the error. Validation
+            // failures that wrote nothing (missing key, exhausted key
+            // generator, unknown store) only fail their own request and the
+            // batch continues.
             let mut success_actions: Vec<CommitSuccessAction> = Vec::new();
             let mut commit_error_actions: Vec<CommitErrorAction> = Vec::new();
+            let mut batch_error: Option<BackendError> = None;
 
             // The guard's scope is deliberately just the transaction creation:
             // the Mutex serializes calls on the shared store handle, while the
@@ -408,7 +415,12 @@ impl KvsEngine for OhosRdbEngine {
                 }
             };
 
-            for request in transaction.requests {
+            let mut requests = transaction.requests.into_iter();
+            while let Some(request) = requests.next() {
+                if batch_error.is_some() {
+                    break;
+                }
+
                 let object_store = match Self::query_optional_object_store(&tx, &request.store_name)
                 {
                     Ok(Some(store)) => store,
@@ -473,20 +485,27 @@ impl KvsEngine for OhosRdbEngine {
                                 )
                             },
                         };
+                        let result = Self::put_item(
+                            &tx,
+                            &object_store,
+                            key,
+                            value,
+                            should_overwrite,
+                            key_generator_current_number,
+                        )
+                        .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                        if let Err(error) = &result {
+                            batch_error = Some(error.clone());
+                        }
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,
                             callback,
-                            Self::put_item(
-                                &tx,
-                                &object_store,
-                                key,
-                                value,
-                                should_overwrite,
-                                key_generator_current_number,
-                            )
-                            .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
+                            result,
                         );
+                        if batch_error.is_some() {
+                            break;
+                        }
                     },
                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetItem {
                         callback,
@@ -538,13 +557,20 @@ impl KvsEngine for OhosRdbEngine {
                         callback,
                         key_range,
                     }) => {
+                        let result = Self::delete_item(&tx, &object_store, key_range)
+                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                        if let Err(error) = &result {
+                            batch_error = Some(error.clone());
+                        }
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,
                             callback,
-                            Self::delete_item(&tx, &object_store, key_range)
-                                .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
+                            result,
                         );
+                        if batch_error.is_some() {
+                            break;
+                        }
                     },
                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Count {
                         callback,
@@ -586,13 +612,20 @@ impl KvsEngine for OhosRdbEngine {
                         );
                     },
                     AsyncOperation::ReadWrite(AsyncReadWriteOperation::Clear(sender)) => {
+                        let result = Self::clear(&tx, &object_store)
+                            .map_err(|error| BackendError::DbErr(format!("{error:?}")));
+                        if let Err(error) = &result {
+                            batch_error = Some(error.clone());
+                        }
                         Self::enqueue_result(
                             &mut success_actions,
                             &mut commit_error_actions,
                             sender,
-                            Self::clear(&tx, &object_store)
-                                .map_err(|error| BackendError::DbErr(format!("{error:?}"))),
+                            result,
                         );
+                        if batch_error.is_some() {
+                            break;
+                        }
                     },
                     AsyncOperation::ReadOnly(AsyncReadOnlyOperation::GetKey {
                         callback,
@@ -613,6 +646,25 @@ impl KvsEngine for OhosRdbEngine {
                         );
                     },
                 }
+            }
+
+            if let Some(error) = batch_error {
+                for request in requests {
+                    Self::enqueue_operation_error(
+                        &mut success_actions,
+                        &mut commit_error_actions,
+                        request.operation,
+                        error.clone(),
+                    );
+                }
+                if let Err(rollback_error) = tx.rollback() {
+                    warn!("Failed to roll back IndexedDB transaction: {rollback_error:?}");
+                }
+                for action in commit_error_actions {
+                    action(error.clone());
+                }
+                on_complete();
+                return;
             }
 
             match tx.commit() {

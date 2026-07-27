@@ -208,7 +208,9 @@ impl<E: WebStorageEngine> WebStorageEnvironment<E> {
         let (data, load_failed) = match engine.load() {
             Ok(data) => (data, false),
             Err(_) => {
-                warn!("Failed to load webstorage data; treating the store as read only");
+                warn!(
+                    "Failed to load webstorage data; keeping the in-memory map empty and skipping the final save"
+                );
                 (Default::default(), true)
             },
         };
