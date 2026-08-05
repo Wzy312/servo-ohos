@@ -6,8 +6,8 @@ use std::cmp::min;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::Arc as StdArc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_recursion::async_recursion;
 use content_security_policy::percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -18,8 +18,7 @@ use headers::authorization::Basic;
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
     AccessControlMaxAge, AccessControlRequestMethod, Authorization, CacheControl, ContentLength,
-    HeaderMapExt, IfModifiedSince, LastModified, Pragma, Referer, StrictTransportSecurity,
-    UserAgent,
+    HeaderMapExt, Pragma, Referer, StrictTransportSecurity, UserAgent,
 };
 use http::header::{
     self, ACCEPT, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION,
@@ -91,10 +90,8 @@ use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
 use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, fetch, main_fetch};
 use crate::hsts::HstsList;
-use crate::http_cache::{
-    CacheKey, CachedResourcesOrGuard, HttpCache, ValidationStatus, construct_response,
-    invalidate_cached_resources, refresh,
-};
+use crate::http_cache::{CacheKey, HttpCache};
+use crate::http_cache_store::BodyWriter;
 use crate::resource_thread::{AuthCache, AuthCacheEntry};
 use crate::websocket_loader::start_websocket;
 
@@ -1543,9 +1540,9 @@ async fn http_network_or_cache_fetch(
     }
 
     // TODO(#33616) Step 8.22 If there’s a proxy-authentication entry, use it as appropriate.
-    let should_wait = {
-        // Enter critical section on cache entry.
-        let mut cache_guard = block_for_cache_ready(
+    let request_key = CacheKey::new(http_request);
+    let should_wait = 'cache_wait: loop {
+        block_for_cache_ready(
             context,
             http_request,
             done_chan,
@@ -1564,64 +1561,83 @@ async fn http_network_or_cache_fetch(
                 return Response::network_error(NetworkError::CacheError);
             }
 
-            // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
-            // includeCredentials, and isNewConnectionFetch.
-            drop(cache_guard);
-            let forward_response =
-                http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
-                    .await;
-
-            let http_request = &mut http_fetch_params.request;
-            let request_key = CacheKey::new(http_request);
-            cache_guard = context
+            match context
                 .state
                 .http_cache
-                .get_or_guard(request_key.clone())
-                .await;
-            // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
-            // inclusive, invalidate appropriate stored responses in httpCache, as per the
-            // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
-            if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
-                if let Some(guard) = cache_guard.try_as_mut() {
-                    invalidate_cached_resources(guard);
-                }
-                context
-                    .state
-                    .http_cache
-                    .invalidate_related_urls(http_request, &forward_response, &request_key)
+                .acquire_inflight(request_key.clone())
+            {
+                crate::http_cache::InFlightReservation::Waiter(waiter) => {
+                    crate::http_cache::InFlightReservation::Waiter(waiter)
+                        .wait()
+                        .await;
+                    revalidating_flag = false;
+                    continue 'cache_wait;
+                },
+                crate::http_cache::InFlightReservation::Producer(_inflight_lease) => {
+                    // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
+                    // includeCredentials, and isNewConnectionFetch.
+                    let forward_response = http_network_fetch(
+                        http_fetch_params,
+                        include_credentials,
+                        done_chan,
+                        context,
+                    )
                     .await;
+
+                    let http_request = &mut http_fetch_params.request;
+                    let request_key = CacheKey::new(http_request);
+                    // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
+                    // inclusive, invalidate appropriate stored responses in httpCache, as per the
+                    // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
+                    if forward_response.status.in_range(200..=399) && !http_request.method.is_safe()
+                    {
+                        context
+                            .state
+                            .http_cache
+                            .invalidate_entry(&request_key)
+                            .await;
+                        context
+                            .state
+                            .http_cache
+                            .invalidate_related_urls(http_request, &forward_response, &request_key)
+                            .await;
+                    }
+
+                    // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+                    if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
+                        // Ensure done_chan is None,
+                        // since the network response will be replaced by the revalidated stored one.
+                        *done_chan = None;
+                        response = context
+                            .state
+                            .http_cache
+                            .refresh_entry(
+                                http_request,
+                                forward_response.clone(),
+                                done_chan,
+                                &request_key,
+                            )
+                            .await;
+
+                        if let Some(response) = &mut response {
+                            response.cache_state = CacheState::Validated;
+                        }
+                    }
+
+                    // Step 10.5 If response is null, then:
+                    if response.is_none() {
+                        // Step 10.5.1 Set response to forwardResponse.
+                        let forward_response = response.insert(forward_response);
+
+                        // The response body is streamed into the cache writer from http_network_fetch.
+                        // This branch only keeps the live response in scope.
+                        let _ = forward_response;
+                    }
+                    break 'cache_wait false;
+                },
             }
-
-            // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
-            if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
-                // Ensure done_chan is None,
-                // since the network response will be replaced by the revalidated stored one.
-                *done_chan = None;
-                if let Some(guard) = cache_guard.try_as_mut() {
-                    response = refresh(http_request, forward_response.clone(), done_chan, guard);
-                }
-
-                if let Some(response) = &mut response {
-                    response.cache_state = CacheState::Validated;
-                }
-            }
-
-            // Step 10.5 If response is null, then:
-            if response.is_none() {
-                // Step 10.5.1 Set response to forwardResponse.
-                let forward_response = response.insert(forward_response);
-
-                // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
-                // if the No-Store directive is present
-                if http_request.cache_mode != CacheMode::NoStore {
-                    // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
-                    //             "Storing Responses in Caches" chapter of HTTP Caching.
-                    cache_guard.insert(http_request, forward_response);
-                }
-            }
-            false
         } else {
-            true
+            break 'cache_wait true;
         }
     }; // Exit Critical Section on cache entry
 
@@ -1798,89 +1814,23 @@ async fn block_for_cache_ready<'a>(
     done_chan: &mut DoneChannel,
     revalidating_flag: &mut bool,
     response: &mut Option<Response>,
-) -> CachedResourcesOrGuard<'a> {
-    let entry_key = CacheKey::new(http_request);
-    let guard_result = context.state.http_cache.get_or_guard(entry_key).await;
-
-    match guard_result {
-        CachedResourcesOrGuard::Guard(_) => {
-            *done_chan = None;
-        },
-        CachedResourcesOrGuard::Value(ref cached_resources) => {
-            // TODO(#33616): Step 8.23 Set httpCache to the result of determining the
-            // HTTP cache partition, given httpRequest.
-            // Step 8.25.1 Set storedResponse to the result of selecting a response from the httpCache,
-            //              possibly needing validation, as per the "Constructing Responses from Caches"
-            //              chapter of HTTP Caching, if any.
-            let stored_response = construct_response(http_request, done_chan, cached_resources);
-            // Step 8.25.2 If storedResponse is non-null, then:
-            if let Some(response_from_cache) = stored_response {
-                let response_headers = response_from_cache.response.headers.clone();
-                let validation_status = response_from_cache.validation_status;
-                let revalidation_guard = response_from_cache.revalidation_guard.clone();
-
-                // Substep 1, 2, 3, 4
-                let (cached_response, needs_synchronous_revalidation) =
-                    match (http_request.cache_mode, &http_request.mode) {
-                        (CacheMode::ForceCache, _) => (Some(response_from_cache.response), false),
-                        (CacheMode::OnlyIfCached, &RequestMode::SameOrigin) => {
-                            (Some(response_from_cache.response), false)
-                        },
-                        (CacheMode::OnlyIfCached, _) |
-                        (CacheMode::NoStore, _) |
-                        (CacheMode::Reload, _) => (None, false),
-                        (_, _) => (
-                            Some(response_from_cache.response),
-                            validation_status ==
-                                (ValidationStatus::Stale {
-                                    revalidate_in_background: false,
-                                }),
-                        ),
-                    };
-
-                if needs_synchronous_revalidation {
-                    *revalidating_flag = true;
-                    // Substep 5
-                    if let Some(http_date) = response_headers.typed_get::<LastModified>() {
-                        let http_date: SystemTime = http_date.into();
-                        http_request
-                            .headers
-                            .typed_insert(IfModifiedSince::from(http_date));
-                    }
-                    if let Some(entity_tag) = response_headers.get(header::ETAG) {
-                        http_request
-                            .headers
-                            .insert(header::IF_NONE_MATCH, entity_tag.clone());
-                    }
-                } else {
-                    // Substep 6
-                    // If it's a stale-while-revalidate response, also refresh it in the background.
-                    let revalidate_in_background = validation_status ==
-                        (ValidationStatus::Stale {
-                            revalidate_in_background: true,
-                        });
-                    if revalidate_in_background && cached_response.is_some() {
-                        spawn_stale_while_revalidate(context, http_request, revalidation_guard);
-                    }
-                    *response = cached_response;
-                    if let Some(response) = response {
-                        response.cache_state = CacheState::Local;
-                    }
-                }
-                if response.is_none() {
-                    // Ensure the done chan is not set if we're not using the cached response,
-                    // as the cache might have set it to Some if it constructed a pending response.
-                    *done_chan = None;
-                }
-            }
-        },
-    }
-    guard_result
+) {
+    context
+        .state
+        .http_cache
+        .prepare_cache_access(
+            context,
+            http_request,
+            done_chan,
+            revalidating_flag,
+            response,
+        )
+        .await
 }
 
 /// The cached (stale) response has already been returned to the caller; here we
 /// fire off an independent fetch whose only purpose is to refresh the stored response.
-fn spawn_stale_while_revalidate(
+pub(crate) fn spawn_stale_while_revalidate(
     context: &FetchContext,
     http_request: &Request,
     revalidation_guard: StdArc<AtomicBool>,
@@ -2091,6 +2041,30 @@ impl Drop for ResponseEndTimer {
     }
 }
 
+#[doc(hidden)]
+pub fn try_write_cache_chunk(
+    cache_writer: &StdArc<Mutex<Option<Box<dyn BodyWriter>>>>,
+    chunk: &Bytes,
+) -> bool {
+    let Some(mut cache_writer) = cache_writer.try_lock() else {
+        return false;
+    };
+
+    let write_result = match cache_writer.as_mut() {
+        Some(writer) => writer.write(chunk.clone()),
+        None => return false,
+    };
+
+    if write_result.is_err() {
+        if let Some(writer) = cache_writer.take() {
+            let _ = writer.abort();
+        }
+        return false;
+    }
+
+    true
+}
+
 /// [HTTP network fetch](https://fetch.spec.whatwg.org/#http-network-fetch)
 #[servo_tracing::instrument(skip_all,fields(url=fetch_params.request.url().as_str()))]
 async fn http_network_fetch(
@@ -2271,6 +2245,18 @@ async fn http_network_fetch(
     response.referrer = request.referrer.to_url().cloned();
     response.referrer_policy = request.referrer_policy;
 
+    let cache_writer = if request.cache_mode == CacheMode::NoStore {
+        None
+    } else {
+        context
+            .state
+            .http_cache
+            .start_streaming_entry(request, &response)
+            .await
+    };
+    let cache_writer = StdArc::new(Mutex::new(cache_writer));
+    let cache_write_drops = StdArc::new(AtomicUsize::new(0));
+
     let res_body = response.body.clone();
 
     // We're about to spawn a future to be waited on here
@@ -2303,6 +2289,10 @@ async fn http_network_fetch(
     let status = response.status.clone();
     let headers = response.headers.clone();
     let devtools_chan = context.devtools_chan.clone();
+    let cache_writer2 = cache_writer.clone();
+    let cache_writer3 = cache_writer.clone();
+    let cache_write_drops2 = cache_write_drops.clone();
+    let cache_write_drops_finish = cache_write_drops.clone();
 
     if let Some(possible_length) = res
         .headers()
@@ -2314,21 +2304,35 @@ async fn http_network_fetch(
         let _ = done_sender.send(Data::ContentLength(possible_length));
     }
 
+    if cancellation_listener.cancelled() {
+        let _ = done_sender.send(Data::Cancelled);
+        if let Some(writer) = cache_writer.lock().take() {
+            let _ = writer.abort();
+        }
+        return Response::network_error(NetworkError::LoadCancelled);
+    }
+
     spawn_task(
         res.into_body()
             .try_fold(res_body, move |res_body, chunk| {
                 if cancellation_listener.cancelled() {
                     *res_body.lock() = ResponseBody::Done(vec![]);
                     let _ = done_sender.send(Data::Cancelled);
+                    if let Some(writer) = cache_writer2.lock().take() {
+                        let _ = writer.abort();
+                    }
                     return future::ready(Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "Fetch aborted",
                     )));
                 }
                 if let ResponseBody::Receiving(ref mut body) = *res_body.lock() {
-                    let bytes = chunk;
+                    let bytes = chunk.clone();
                     body.extend_from_slice(&bytes);
                     let _ = done_sender.send(Data::Payload(bytes.to_vec()));
+                }
+                if !try_write_cache_chunk(&cache_writer2, &chunk) {
+                    cache_write_drops2.fetch_add(1, Ordering::Relaxed);
                 }
                 future::ready(Ok(res_body))
             })
@@ -2349,6 +2353,13 @@ async fn http_network_fetch(
                     &devtools_request,
                     devtools_chan,
                 );
+                if let Some(writer) = cache_writer3.lock().take() {
+                    if cache_write_drops_finish.load(Ordering::Relaxed) > 0 {
+                        let _ = writer.abort();
+                    } else {
+                        let _ = writer.finish();
+                    }
+                }
                 timing_ptr2.set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender2.send(Data::Done);
                 future::ready(Ok(()))
@@ -2361,6 +2372,9 @@ async fn http_network_fetch(
 
                     *body = ResponseBody::Done(vec![]);
                 }
+                if let Some(writer) = cache_writer.lock().take() {
+                    let _ = writer.abort();
+                }
                 debug!("finished response for {:?}", url2);
                 let mut body = res_body2.lock();
                 let completed_body = match *body {
@@ -2369,7 +2383,7 @@ async fn http_network_fetch(
                 };
                 *body = ResponseBody::Done(completed_body);
                 timing_ptr3.set_attribute(ResourceAttribute::ResponseEnd);
-                let _ = done_sender3.send(Data::Done);
+                let _ = done_sender3.send(Data::Cancelled);
             }),
     );
 

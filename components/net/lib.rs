@@ -15,6 +15,10 @@ pub mod filemanager_thread;
 mod hosts;
 pub mod hsts;
 pub mod http_cache;
+#[cfg(feature = "disk-http-cache")]
+pub mod http_cache_disk;
+pub(crate) mod http_cache_semantics;
+pub(crate) mod http_cache_store;
 pub mod http_loader;
 pub mod image_cache;
 pub mod local_directory_listing;
@@ -25,6 +29,10 @@ pub mod subresource_integrity;
 #[cfg(feature = "test-util")]
 pub mod test_util;
 mod websocket_loader;
+
+#[cfg(feature = "disk-http-cache")]
+pub use crate::http_cache_disk::DiskStore;
+pub use crate::http_cache_store::HttpCacheStore;
 
 /// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
 pub mod fetch {
@@ -38,5 +46,11 @@ pub mod fetch {
 pub mod test {
     pub use crate::decoder::{BodyStreamError, DECODER_BUFFER_SIZE, map_decode_error};
     pub use crate::hosts::parse_hostsfile;
+    #[cfg(feature = "disk-http-cache")]
+    pub use crate::http_cache_disk::DiskStore;
+    pub use crate::http_cache_store::{
+        BodyHandle, BodyWriter, HttpCacheStore, MemoryStore, StoreError, StoredVariantMeta,
+        build_stored_variant_meta, collect_body,
+    };
     pub use crate::http_loader::HttpState;
 }

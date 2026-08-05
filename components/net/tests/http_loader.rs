@@ -31,9 +31,9 @@ use hyper::{Request as HyperRequest, Response as HyperResponse};
 use net::cookie::ServoCookie;
 use net::cookie_storage::CookieStorage;
 use net::fetch::methods::{self};
-use net::http_loader::{determine_requests_referrer, serialize_origin};
+use net::http_loader::{determine_requests_referrer, serialize_origin, try_write_cache_chunk};
 use net::resource_thread::AuthCacheEntry;
-use net::test::DECODER_BUFFER_SIZE;
+use net::test::{BodyHandle, BodyWriter, DECODER_BUFFER_SIZE, StoreError};
 use net_traits::blob_url_store::UrlWithBlobClaim;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
@@ -1638,6 +1638,40 @@ fn test_fetch_compressed_response_update_count() {
 }
 
 #[test]
+fn test_try_write_cache_chunk_drops_when_cache_writer_mutex_is_contended() {
+    #[derive(Default)]
+    struct NoopWriter;
+
+    impl BodyWriter for NoopWriter {
+        fn body_handle(&self) -> BodyHandle {
+            BodyHandle::new(vec![])
+        }
+
+        fn write(&mut self, _chunk: Bytes) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn abort(self: Box<Self>) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    let cache_writer = Arc::new(Mutex::new(Some(
+        Box::new(NoopWriter::default()) as Box<dyn BodyWriter>
+    )));
+    let _guard = cache_writer.lock();
+
+    assert!(!try_write_cache_chunk(
+        &cache_writer,
+        &Bytes::from_static(b"abc")
+    ));
+}
+
+#[test]
 fn test_origin_serialization_compatibility() {
     let ensure_serialiations_match = |url_string| {
         let url = Url::parse(url_string).unwrap();
@@ -2160,6 +2194,237 @@ fn test_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
         request_count.load(Ordering::SeqCst),
         2,
         "exactly one background revalidation should have hit the server"
+    );
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_private_stale_while_revalidate_serves_cached_and_revalidates_in_background() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            request_count_clone.fetch_add(1, Ordering::SeqCst);
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=0, stale-while-revalidate=30"),
+            );
+            *response.body_mut() = make_body(b"content".to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let mut context = new_fetch_context(None, None);
+
+    let build_request = || {
+        RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .method(Method::GET)
+            .destination(Destination::Document)
+            .origin(url.clone().origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build()
+    };
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert!(response.actual_response().status.code().is_success());
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert!(response.actual_response().status.code().is_success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while request_count.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        request_count.load(Ordering::SeqCst),
+        2,
+        "exactly one background revalidation should have hit the server"
+    );
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_private_stale_while_revalidate_query_poll_observes_refresh() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            let is_query = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("query"));
+            if !is_query {
+                request_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let count = request_count_clone.load(Ordering::SeqCst);
+            if is_query {
+                response
+                    .headers_mut()
+                    .insert("Count", HeaderValue::from_str(&count.to_string()).unwrap());
+                return;
+            }
+
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=0, stale-while-revalidate=30"),
+            );
+            *response.body_mut() = make_body(b"content".to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let mut context = new_fetch_context(None, None);
+
+    let build_request = || {
+        RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .method(Method::GET)
+            .destination(Destination::Document)
+            .origin(url.clone().origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build()
+    };
+
+    let query_url = ServoUrl::parse(&format!("{}?query", url.url())).unwrap();
+    let build_query_request = || {
+        RequestBuilder::new(
+            None,
+            UrlWithBlobClaim::new(query_url.clone(), None),
+            Referrer::NoReferrer,
+        )
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(query_url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build()
+    };
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert!(response.actual_response().status.code().is_success());
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert!(response.actual_response().status.code().is_success());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while request_count.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        let query_response = fetch_with_context(build_query_request(), &mut context);
+        assert!(query_response.actual_response().status.code().is_success());
+        let count = query_response
+            .actual_response()
+            .headers
+            .get("Count")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap();
+        if count == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_private_stale_while_revalidate_followup_load_sees_refreshed_response() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_clone = request_count.clone();
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            let is_query = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("query"));
+            if !is_query {
+                request_count_clone.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let count = request_count_clone.load(Ordering::SeqCst);
+            if is_query {
+                response
+                    .headers_mut()
+                    .insert("Count", HeaderValue::from_str(&count.to_string()).unwrap());
+                return;
+            }
+
+            let body = if count > 1 { b"fresh" } else { b"stale" };
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=0, stale-while-revalidate=30"),
+            );
+            *response.body_mut() = make_body(body.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let mut context = new_fetch_context(None, None);
+
+    let build_request = || {
+        RequestBuilder::new(None, url.clone(), Referrer::NoReferrer)
+            .method(Method::GET)
+            .destination(Destination::Document)
+            .origin(url.clone().origin())
+            .pipeline_id(Some(TEST_PIPELINE_ID))
+            .policy_container(Default::default())
+            .build()
+    };
+
+    let query_url = ServoUrl::parse(&format!("{}?query", url.url())).unwrap();
+    let build_query_request = || {
+        RequestBuilder::new(
+            None,
+            UrlWithBlobClaim::new(query_url.clone(), None),
+            Referrer::NoReferrer,
+        )
+        .method(Method::GET)
+        .destination(Destination::Document)
+        .origin(query_url.clone().origin())
+        .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
+        .build()
+    };
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert_eq!(
+        &*response.actual_response().body.lock(),
+        &ResponseBody::Done(b"stale".to_vec())
+    );
+
+    let response = fetch_with_context(build_request(), &mut context);
+    assert_eq!(
+        &*response.actual_response().body.lock(),
+        &ResponseBody::Done(b"stale".to_vec())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while request_count.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        let query_response = fetch_with_context(build_query_request(), &mut context);
+        let count = query_response
+            .actual_response()
+            .headers
+            .get("Count")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap();
+        if count == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let followup = fetch_with_context(build_request(), &mut context);
+    assert_eq!(
+        &*followup.actual_response().body.lock(),
+        &ResponseBody::Done(b"fresh".to_vec())
     );
 
     let _ = server.close();

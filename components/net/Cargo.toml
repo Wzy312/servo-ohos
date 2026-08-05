@@ -17,7 +17,8 @@ test = false
 doctest = false
 
 [features]
-test-util = ["hyper-util/server-graceful", "dep:servo-default-resources", "net_traits/test-util"]
+disk-http-cache = []
+test-util = ["hyper-util/server-graceful", "dep:servo-default-resources", "net_traits/test-util", "disk-http-cache"]
 tracing = ["dep:tracing"]
 
 [dependencies]
@@ -68,6 +69,7 @@ rustls = { workspace = true, features = ["aws-lc-rs"] }
 rustls-pki-types = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
 servo-default-resources = { workspace = true, optional = true }
@@ -98,7 +100,9 @@ hyper-util = { workspace = true, features = ["server-graceful"] }
 # crates.io version of ourselves - we want to enable a feature of ourselves.
 net = { package = "servo-net", path = ".", features = ["test-util"] }
 rustls = { workspace = true, features = ["aws-lc-rs"] }
+serde_json = { workspace = true }
 servo-default-resources = { workspace = true }
+tempfile = { workspace = true }
 
 [[test]]
 name = "main"

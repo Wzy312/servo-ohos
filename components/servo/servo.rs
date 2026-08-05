@@ -28,6 +28,7 @@ use layout::LayoutFactoryImpl;
 use layout_api::ScriptThreadFactory;
 use log::{Log, Metadata, Record, debug, warn};
 use media::{GlApi, NativeDisplay, WindowGLContext};
+use net::HttpCacheStore;
 use net::embedder::NetToEmbedderMsg;
 use net::image_cache::ImageCacheFactoryImpl;
 use net::protocols::ProtocolRegistry;
@@ -970,6 +971,7 @@ impl Servo {
                 opts.certificate_path.clone(),
                 opts.ignore_certificate_errors,
                 protocols.clone(),
+                builder.http_cache_store,
             );
 
         let (private_storage_threads, public_storage_threads) = new_storage_threads(
@@ -1412,6 +1414,7 @@ pub struct ServoBuilder {
     preferences: Option<Box<Preferences>>,
     event_loop_waker: Box<dyn EventLoopWaker>,
     protocol_registry: ProtocolRegistry,
+    http_cache_store: Option<Box<dyn HttpCacheStore>>,
 }
 
 impl Default for ServoBuilder {
@@ -1421,6 +1424,7 @@ impl Default for ServoBuilder {
             preferences: Default::default(),
             event_loop_waker: Box::new(DefaultEventLoopWaker),
             protocol_registry: Default::default(),
+            http_cache_store: Default::default(),
         }
     }
 }
@@ -1447,6 +1451,11 @@ impl ServoBuilder {
 
     pub fn protocol_registry(mut self, protocol_registry: ProtocolRegistry) -> Self {
         self.protocol_registry = protocol_registry;
+        self
+    }
+
+    pub fn http_cache_store(mut self, store: Box<dyn HttpCacheStore>) -> Self {
+        self.http_cache_store = Some(store);
         self
     }
 }

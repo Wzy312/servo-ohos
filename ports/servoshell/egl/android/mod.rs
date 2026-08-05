@@ -228,6 +228,9 @@ pub extern "C" fn Java_org_servo_servoview_JNIServo_init<'local>(
                 opts,
                 preferences,
                 servoshell_preferences,
+                // Android keeps Servo's in-memory HTTP cache; the disk backend
+                // is only wired up for OHOS so far.
+                http_cache_store: None,
                 #[cfg(feature = "webxr")]
                 xr_discovery: None,
             });

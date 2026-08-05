@@ -69,6 +69,13 @@ pub use keyboard_types::{
 pub use media::{
     GlApi as MediaGlApi, GlContext as MediaGlContext, NativeDisplay as MediaNativeDisplay,
 };
+#[cfg(feature = "disk-http-cache")]
+pub use net::DiskStore;
+/// The HTTP cache storage backend an embedder can supply through
+/// [`ServoBuilder::http_cache_store`]. Without this re-export the builder
+/// method could not be called from outside the `servo` crate, since its
+/// parameter type would not be nameable.
+pub use net::HttpCacheStore;
 pub use net::image_cache::should_panic_hook_suppress_termination;
 pub use net_traits::CookieSource;
 // This API should probably not be exposed in this way. Instead there should be a fully

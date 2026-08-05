@@ -289,6 +289,9 @@ pub(crate) struct AppInitOptions {
     pub opts: Opts,
     pub preferences: Preferences,
     pub servoshell_preferences: ServoShellPreferences,
+    /// HTTP cache storage backend to hand to the embedder API. `None` keeps
+    /// Servo's in-memory default.
+    pub http_cache_store: Option<Box<dyn servo::HttpCacheStore>>,
     #[cfg(feature = "webxr")]
     pub xr_discovery: Option<servo::webxr::Discovery>,
 }
@@ -310,6 +313,9 @@ impl App {
             .opts(init.opts)
             .preferences(init.preferences.clone())
             .event_loop_waker(init.event_loop_waker.clone());
+        if let Some(http_cache_store) = init.http_cache_store {
+            servo_builder = servo_builder.http_cache_store(http_cache_store);
+        }
         let servo = servo_builder.build();
         #[cfg(feature = "webxr")]
         servo.register_webxr_registry(Box::new(XrDiscoveryWebXrRegistry::new(init.xr_discovery)));

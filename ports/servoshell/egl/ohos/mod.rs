@@ -87,7 +87,7 @@ use raw_window_handle::{
 };
 use servo::{
     self, DevicePixel, EventLoopWaker, InputMethodControl, InputMethodType, LoadStatus,
-    MediaSessionPlaybackState, PrefValue, SelectElement, WebViewId, Zero,
+    MediaSessionPlaybackState, PrefValue, Preferences, SelectElement, WebViewId, Zero,
 };
 use xcomponent_sys::{
     OH_NativeXComponent, OH_NativeXComponent_Callback, OH_NativeXComponent_GetKeyEvent,
@@ -307,6 +307,8 @@ fn init_app(
     #[cfg(target_env = "ohos")]
     crate::egl::ohos::set_log_filter(servoshell_preferences.log_filter.as_deref());
 
+    let http_cache_store = build_http_cache_store(&native_values.cache_dir, &preferences);
+
     Ok(App::new(AppInitOptions {
         host: Rc::new(HostCallbacks::new()),
         event_loop_waker,
@@ -314,9 +316,54 @@ fn init_app(
         opts,
         preferences,
         servoshell_preferences,
+        http_cache_store,
         #[cfg(feature = "webxr")]
         xr_discovery: None,
     }))
+}
+
+/// Build the disk-backed HTTP cache store for this device, or `None` to keep
+/// Servo's in-memory default.
+///
+/// The cache directory comes from the application sandbox
+/// (`OH_AbilityRuntime_ApplicationContextGetCacheDir`), which is the only
+/// location a running OHOS app can write to. A budget of zero selects the
+/// in-memory backend, so both can be reached from one installed package.
+///
+/// Each path below logs the backend it settled on, so a device run that fell
+/// back to memory can be told apart from one that did not.
+fn build_http_cache_store(
+    cache_dir: &str,
+    preferences: &Preferences,
+) -> Option<Box<dyn servo::HttpCacheStore>> {
+    #[cfg(feature = "disk-http-cache")]
+    {
+        let budget = preferences.network_http_disk_cache_size;
+        if budget == 0 {
+            info!("HTTP cache backend: memory (disk budget is zero)");
+            return None;
+        }
+        let path = PathBuf::from(cache_dir).join("http-cache");
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            warn!(
+                "HTTP cache backend: memory (could not create {}: {error})",
+                path.display()
+            );
+            return None;
+        }
+        let store = servo::DiskStore::new(&path, budget);
+        info!(
+            "HTTP cache backend: disk at {} with a {budget}-byte budget",
+            path.display()
+        );
+        Some(Box::new(store))
+    }
+    #[cfg(not(feature = "disk-http-cache"))]
+    {
+        let _ = (cache_dir, preferences);
+        info!("HTTP cache backend: memory (built without disk-http-cache)");
+        None
+    }
 }
 
 #[napi(object)]

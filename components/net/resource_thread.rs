@@ -66,6 +66,7 @@ use crate::fetch::methods::{
 use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
+use crate::http_cache_store::HttpCacheStore;
 use crate::http_loader::{HttpState, http_redirect_fetch};
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
@@ -95,6 +96,7 @@ pub fn new_resource_threads(
     certificate_path: Option<String>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    http_cache_store: Option<Box<dyn HttpCacheStore>>,
 ) -> (ResourceThreads, ResourceThreads, Box<dyn AsyncRuntime>) {
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
@@ -116,6 +118,7 @@ pub fn new_resource_threads(
         ca_certificates,
         ignore_certificate_errors,
         protocols,
+        http_cache_store,
     );
     (
         ResourceThreads::new(public_core),
@@ -135,6 +138,7 @@ pub fn new_core_resource_thread(
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
+    http_cache_store: Option<Box<dyn HttpCacheStore>>,
 ) -> (CoreResourceThread, CoreResourceThread) {
     let (public_setup_chan, public_setup_port) = generic_channel::channel().unwrap();
     let (private_setup_chan, private_setup_port) = generic_channel::channel().unwrap();
@@ -163,6 +167,7 @@ pub fn new_core_resource_thread(
                 config_dir,
                 ca_certificates,
                 ignore_certificate_errors,
+                http_cache_store,
                 cancellation_listeners: Default::default(),
                 cookie_listeners: Default::default(),
             };
@@ -193,6 +198,7 @@ struct ResourceChannelManager {
     config_dir: Option<PathBuf>,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
+    http_cache_store: Option<Box<dyn HttpCacheStore>>,
     cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
     cookie_listeners: FxHashMap<CookieStoreId, GenericCallback<CookieAsyncResponse>>,
 }
@@ -203,6 +209,7 @@ fn create_http_states(
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+    http_cache_store: Option<Box<dyn HttpCacheStore>>,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::default();
     let mut auth_cache = AuthCache::default();
@@ -219,7 +226,7 @@ fn create_http_states(
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(auth_cache),
         history_states: RwLock::new(FxHashMap::default()),
-        http_cache: HttpCache::default(),
+        http_cache: http_cache_store.map_or_else(HttpCache::default, HttpCache::with_store),
         client: create_http_client(create_tls_config(
             ca_certificates.clone(),
             ignore_certificate_errors,
@@ -265,6 +272,7 @@ impl ResourceChannelManager {
             self.ca_certificates.clone(),
             self.ignore_certificate_errors,
             embedder_proxy,
+            self.http_cache_store.take(),
         );
 
         let mut rx_set = GenericReceiverSet::new();
@@ -959,5 +967,129 @@ impl CoreResourceManager {
                 },
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures_util::future::BoxFuture;
+    use futures_util::stream::{self, BoxStream, StreamExt};
+    use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+    use net_traits::CacheEntryDescriptor;
+
+    use super::*;
+    use crate::http_cache::CacheKey;
+    use crate::http_cache_store::{
+        BodyHandle, BodyWriter, StoreError, StoredVariant, StoredVariantMeta,
+        build_stored_variant_meta,
+    };
+
+    #[derive(Clone)]
+    struct SentinelStore {
+        meta: StoredVariantMeta,
+    }
+
+    impl MallocSizeOf for SentinelStore {
+        fn size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+            1
+        }
+    }
+
+    struct SentinelWriter;
+
+    impl BodyWriter for SentinelWriter {
+        fn body_handle(&self) -> BodyHandle {
+            BodyHandle::new(vec![])
+        }
+
+        fn write(&mut self, _chunk: Bytes) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn finish(self: Box<Self>) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn abort(self: Box<Self>) -> Result<(), StoreError> {
+            Ok(())
+        }
+    }
+
+    impl HttpCacheStore for SentinelStore {
+        fn lookup<'a>(&'a self, _key: &'a CacheKey) -> BoxFuture<'a, Vec<StoredVariant>> {
+            let meta = self.meta.clone();
+            Box::pin(async move {
+                vec![StoredVariant {
+                    meta,
+                    body: BodyHandle::new(vec![]),
+                }]
+            })
+        }
+
+        fn open_body<'a>(
+            &'a self,
+            _handle: &'a BodyHandle,
+        ) -> BoxFuture<'a, Result<BoxStream<'static, Bytes>, StoreError>> {
+            Box::pin(async move { Ok(stream::empty().boxed()) })
+        }
+
+        fn start_entry<'a>(
+            &'a self,
+            _key: &'a CacheKey,
+            _meta: StoredVariantMeta,
+        ) -> BoxFuture<'a, Result<Box<dyn BodyWriter>, StoreError>> {
+            Box::pin(async move { Ok(Box::new(SentinelWriter) as Box<dyn BodyWriter>) })
+        }
+
+        fn update_meta<'a>(
+            &'a self,
+            _handle: &'a BodyHandle,
+            _meta: StoredVariantMeta,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {})
+        }
+
+        fn remove<'a>(&'a self, _key: &'a CacheKey) -> BoxFuture<'a, ()> {
+            Box::pin(async move {})
+        }
+
+        fn clear<'a>(&'a self) -> BoxFuture<'a, ()> {
+            Box::pin(async move {})
+        }
+
+        fn entries<'a>(&'a self) -> BoxFuture<'a, Vec<CacheEntryDescriptor>> {
+            Box::pin(async move { vec![] })
+        }
+    }
+
+    #[tokio::test]
+    async fn public_http_state_uses_injected_store_and_private_state_stays_memory_only() {
+        let url = ServoUrl::parse("https://servo.org/resource-thread-store").unwrap();
+        let key = CacheKey::from_url(url.clone());
+        let store = SentinelStore {
+            meta: build_stored_variant_meta(&url, 13),
+        };
+
+        let (public_http_state, private_http_state) = create_http_states(
+            None,
+            CACertificates::Default,
+            false,
+            crate::test_util::create_generic_embedder_proxy(),
+            Some(Box::new(store)),
+        );
+
+        let public_meta = public_http_state
+            .http_cache
+            .store_lookup_for_test(&key)
+            .await;
+        let private_meta = private_http_state
+            .http_cache
+            .store_lookup_for_test(&key)
+            .await;
+
+        assert_eq!(public_meta.len(), 1);
+        assert_eq!(public_meta[0].body_len(), 13);
+        assert!(private_meta.is_empty());
     }
 }

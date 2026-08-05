@@ -71,6 +71,7 @@ tracing = [
     "script/tracing",
     "net/tracing",
 ]
+disk-http-cache = ["net/disk-http-cache"]
 vello = ["servo-constellation/vello"]
 webgl_backtrace = [
     "script/webgl_backtrace",
