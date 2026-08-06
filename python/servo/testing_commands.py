@@ -194,6 +194,7 @@ class MachCommands(CommandBase):
             packages = set()
 
         self_contained_tests = [
+            "arkweb",
             "servo-background-hang-monitor",
             "servo-base",
             "servo-constellation",

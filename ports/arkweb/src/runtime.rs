@@ -148,13 +148,7 @@ fn js_value_to_string(value: &JSValue) -> String {
     match value {
         JSValue::String(string) => string.clone(),
         JSValue::Boolean(boolean) => boolean.to_string(),
-        JSValue::Number(number) => {
-            if number.fract() == 0.0 && number.is_finite() {
-                format!("{}", *number as i64)
-            } else {
-                number.to_string()
-            }
-        },
+        JSValue::Number(number) => crate::convert::format_js_number(*number),
         JSValue::Null => "null".to_owned(),
         JSValue::Undefined => "undefined".to_owned(),
         other => format!("{other:?}"),
@@ -177,12 +171,7 @@ fn oh_key_to_servo_key(keycode: i32, unicode: i32) -> Option<Key> {
         2081 => NamedKey::Home,         // KEY_MOVE_HOME
         2082 => NamedKey::End,          // KEY_MOVE_END
         _ => {
-            return u32::try_from(unicode)
-                .ok()
-                .filter(|&u| u != 0)
-                .and_then(char::from_u32)
-                .filter(|c| !c.is_control())
-                .map(|c| Key::Character(c.to_string()));
+            return crate::convert::printable_char(unicode).map(|c| Key::Character(c.to_string()));
         },
     };
     Some(Key::Named(named))
