@@ -10,9 +10,34 @@ use storage_traits::indexeddb::{
     AsyncOperation, CreateObjectResult, IndexedDBIndex, IndexedDBTxnMode, KeyPath,
 };
 
-pub use self::sqlite::SqliteEngine;
+#[cfg(ohos_rdb)]
+mod ohos_rdb;
 
+#[path = "sqlite/encoding.rs"]
+pub(crate) mod encoding;
+
+#[cfg(ohos_rdb)]
+pub(crate) mod shared;
+
+#[cfg(feature = "sqlite-backend")]
 mod sqlite;
+
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+mod twin;
+
+// `ActiveKvsEngine` is the engine the IndexedDB manager runs on. A build with
+// both backends compiled in resolves it to the twin, which picks one per
+// database open, so call sites stay untouched in every configuration.
+#[cfg(all(not(feature = "sqlite-backend"), ohos_rdb))]
+pub(crate) use ohos_rdb::OhosRdbEngine as ActiveKvsEngine;
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+pub(crate) use twin::TwinEngine as ActiveKvsEngine;
+
+#[cfg(all(feature = "sqlite-backend", not(ohos_rdb)))]
+pub(crate) use self::sqlite::SqliteEngine as ActiveKvsEngine;
+#[cfg(feature = "sqlite-backend")]
+#[allow(unused_imports)]
+pub(crate) use self::sqlite::SqliteEngine;
 
 #[derive(MallocSizeOf)]
 pub struct KvsOperation {
@@ -40,7 +65,8 @@ pub trait KvsEngine: MallocSizeOf {
 
     fn delete_store(&self, store_name: &str) -> Result<(), Self::Error>;
 
-    #[expect(dead_code)]
+    // Unused with a single backend compiled in; the twin engine delegates it.
+    #[allow(dead_code)]
     fn close_store(&self, store_name: &str) -> Result<(), Self::Error>;
 
     fn process_transaction(

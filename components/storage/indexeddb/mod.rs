@@ -7,17 +7,22 @@ mod engines;
 use std::borrow::ToOwned;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(ohos_rdb)]
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::thread;
 
 use log::{debug, error, warn};
 use malloc_size_of::MallocSizeOf;
 use malloc_size_of_derive::MallocSizeOf;
+#[cfg(ohos_rdb)]
+use ohos_rdb_sys::relational_store_error_code::OH_Rdb_ErrCode;
 use profile_traits::generic_callback::GenericCallback;
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, perform_memory_report,
 };
 use profile_traits::path;
+#[cfg(feature = "sqlite-backend")]
 use rusqlite::Error as RusqliteError;
 use rustc_hash::{FxHashMap, FxHashSet};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender, ReceiveError};
@@ -31,7 +36,10 @@ use storage_traits::indexeddb::{
 };
 use uuid::Uuid;
 
-use crate::indexeddb::engines::{KvsEngine, KvsOperation, KvsTransaction, SqliteEngine};
+use crate::indexeddb::engines::{ActiveKvsEngine, KvsEngine, KvsOperation, KvsTransaction};
+#[cfg(ohos_rdb)]
+use crate::ohos_rdb::OhosRdbError;
+#[cfg(feature = "sqlite-backend")]
 use crate::shared::is_sqlite_disk_full_error;
 
 pub trait IndexedDBThreadFactory {
@@ -806,12 +814,46 @@ impl<E: KvsEngine> IndexedDBEnvironment<E> {
     }
 }
 
-fn backend_error_from_sqlite_error(err: RusqliteError) -> BackendError {
-    if is_sqlite_disk_full_error(&err) {
-        BackendError::QuotaExceeded
-    } else {
-        BackendError::DbErr(format!("{err:?}"))
+trait BackendErrorMapper: std::error::Error {
+    fn into_backend_error(self) -> BackendError;
+}
+
+#[cfg(feature = "sqlite-backend")]
+impl BackendErrorMapper for RusqliteError {
+    fn into_backend_error(self) -> BackendError {
+        if is_sqlite_disk_full_error(&self) {
+            BackendError::QuotaExceeded
+        } else {
+            BackendError::DbErr(format!("{self:?}"))
+        }
     }
+}
+
+#[cfg(ohos_rdb)]
+impl BackendErrorMapper for OhosRdbError {
+    fn into_backend_error(self) -> BackendError {
+        if matches!(self, OhosRdbError::Api { code, .. } if code == OH_Rdb_ErrCode::RDB_E_SQLITE_FULL.0 || code == OH_Rdb_ErrCode::RDB_E_SQLITE_IOERR.0) ||
+            crate::shared::has_enospc(Some(&self as &(dyn StdError + 'static)))
+        {
+            BackendError::QuotaExceeded
+        } else {
+            BackendError::DbErr(format!("{self:?}"))
+        }
+    }
+}
+
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+impl BackendErrorMapper for crate::shared::TwinError {
+    fn into_backend_error(self) -> BackendError {
+        match self {
+            Self::Sqlite(error) => error.into_backend_error(),
+            Self::Rdb(error) => error.into_backend_error(),
+        }
+    }
+}
+
+fn backend_error_from_storage_error<E: BackendErrorMapper>(err: E) -> BackendError {
+    err.into_backend_error()
 }
 
 /// <https://w3c.github.io/IndexedDB/#request-open-request>
@@ -1015,7 +1057,7 @@ struct Connection {
 struct IndexedDBManager {
     port: GenericReceiver<IndexedDBThreadMsg>,
     manager_sender: GenericSender<IndexedDBThreadMsg>,
-    databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<SqliteEngine>>,
+    databases: HashMap<IndexedDBDescription, IndexedDBEnvironment<ActiveKvsEngine>>,
     thread_pool: Arc<ThreadPool>,
 
     /// A global counter to produce unique transaction ids.
@@ -1562,7 +1604,7 @@ impl IndexedDBManager {
         &self,
         origin: ImmutableOrigin,
         db_name: String,
-    ) -> Option<&IndexedDBEnvironment<SqliteEngine>> {
+    ) -> Option<&IndexedDBEnvironment<ActiveKvsEngine>> {
         let idb_description = IndexedDBDescription {
             origin,
             name: db_name,
@@ -1575,7 +1617,7 @@ impl IndexedDBManager {
         &mut self,
         origin: ImmutableOrigin,
         db_name: String,
-    ) -> Option<&mut IndexedDBEnvironment<SqliteEngine>> {
+    ) -> Option<&mut IndexedDBEnvironment<ActiveKvsEngine>> {
         let idb_description = IndexedDBDescription {
             origin,
             name: db_name,
@@ -1828,28 +1870,28 @@ impl IndexedDBManager {
                         return;
                     },
                 };
-                let engine = match SqliteEngine::new(path, created, &key, self.thread_pool.clone())
-                {
-                    Ok(engine) => engine,
-                    Err(err) => {
-                        let error = backend_error_from_sqlite_error(err);
-                        if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
-                            id: *id,
-                            name: db_name.clone(),
-                            error,
-                        }) {
-                            debug!("Script exit during indexeddb database open {:?}", e);
-                        }
-                        *processed = true;
-                        return;
-                    },
-                };
+                let engine =
+                    match ActiveKvsEngine::new(path, created, &key, self.thread_pool.clone()) {
+                        Ok(engine) => engine,
+                        Err(err) => {
+                            let error = backend_error_from_storage_error(err);
+                            if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
+                                id: *id,
+                                name: db_name.clone(),
+                                error,
+                            }) {
+                                debug!("Script exit during indexeddb database open {:?}", e);
+                            }
+                            *processed = true;
+                            return;
+                        },
+                    };
                 let created_db_path = engine.created_db_path();
                 let db = IndexedDBEnvironment::new(engine, self.manager_sender.clone());
                 let db_version = match db.version() {
                     Ok(version) => version,
                     Err(err) => {
-                        let error = backend_error_from_sqlite_error(err);
+                        let error = backend_error_from_storage_error(err);
                         if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
                             id: *id,
                             name: db_name.clone(),
@@ -1875,7 +1917,7 @@ impl IndexedDBManager {
                 let db_version = match db.get().version() {
                     Ok(version) => version,
                     Err(err) => {
-                        let error = backend_error_from_sqlite_error(err);
+                        let error = backend_error_from_storage_error(err);
                         if let Err(e) = sender.send(ConnectionMsg::DatabaseError {
                             id: *id,
                             name: db_name.clone(),
@@ -2405,14 +2447,14 @@ impl IndexedDBManager {
                         let _ = db.set_version(version);
                     }
                     // erroring out if the version is not upgraded can be and non-replicable
-                    let _ = sender.send(db.version().map_err(backend_error_from_sqlite_error));
+                    let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
                 } else {
                     let _ = sender.send(Err(BackendError::DbNotFound));
                 }
             },
             SyncOperation::Version(sender, origin, db_name) => {
                 if let Some(db) = self.get_database(origin, db_name) {
-                    let _ = sender.send(db.version().map_err(backend_error_from_sqlite_error));
+                    let _ = sender.send(db.version().map_err(backend_error_from_storage_error));
                 } else {
                     let _ = sender.send(Err(BackendError::DbNotFound));
                 }
@@ -2491,6 +2533,7 @@ impl IndexedDBManager {
     }
 }
 
+#[cfg(feature = "sqlite-backend")]
 #[cfg(test)]
 mod tests {
     use servo_base::generic_channel;
@@ -2574,5 +2617,106 @@ mod tests {
         env.abort_transaction(1);
 
         assert_eq!(env.key_generator_current_number("books"), Some(1));
+    }
+
+    #[derive(Debug)]
+    struct DummyError {
+        quota_exceeded: bool,
+    }
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "DummyError(quota_exceeded={})", self.quota_exceeded)
+        }
+    }
+
+    impl std::error::Error for DummyError {}
+
+    impl super::BackendErrorMapper for DummyError {
+        fn into_backend_error(self) -> storage_traits::indexeddb::BackendError {
+            if self.quota_exceeded {
+                storage_traits::indexeddb::BackendError::QuotaExceeded
+            } else {
+                storage_traits::indexeddb::BackendError::DbErr(format!("{self:?}"))
+            }
+        }
+    }
+
+    #[test]
+    fn test_backend_error_from_storage_error_maps_quota_exceeded() {
+        assert_eq!(
+            super::backend_error_from_storage_error(DummyError {
+                quota_exceeded: true,
+            }),
+            storage_traits::indexeddb::BackendError::QuotaExceeded
+        );
+    }
+
+    #[test]
+    fn test_backend_error_from_storage_error_preserves_other_errors() {
+        match super::backend_error_from_storage_error(DummyError {
+            quota_exceeded: false,
+        }) {
+            storage_traits::indexeddb::BackendError::DbErr(message) => {
+                assert!(message.contains("DummyError"));
+            },
+            other => panic!("unexpected backend error: {other:?}"),
+        }
+    }
+}
+
+#[cfg(all(test, ohos_rdb))]
+mod tests_ohos {
+    use tempfile::tempdir;
+
+    use super::backend_error_from_storage_error;
+    use crate::ohos_rdb::{OhosRdbStore, OhosRdbValues};
+    use crate::shared::has_enospc;
+
+    #[test]
+    fn has_enospc_detects_enospc_and_nothing_else() {
+        let full = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert!(has_enospc(Some(&full)));
+        let denied = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert!(!has_enospc(Some(&denied)));
+        assert!(!has_enospc(None));
+    }
+
+    #[test]
+    fn sql_full_maps_to_quota_exceeded() {
+        let dir = tempdir().unwrap();
+        let store = OhosRdbStore::open(dir.path(), "quota-exceeded").unwrap();
+        let tx = store.transaction().unwrap();
+        let values = OhosRdbValues::new().unwrap();
+        tx.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);",
+            &values,
+        )
+        .unwrap();
+        tx.execute("PRAGMA max_page_count = 2;", &values).unwrap();
+
+        let mut error = None;
+        for i in 0..128 {
+            let mut insert_values = OhosRdbValues::new().unwrap();
+            insert_values.push_int(i).unwrap();
+            insert_values.push_blob(&vec![0u8; 65536]).unwrap();
+            match tx.execute("INSERT INTO t (id, data) VALUES (?1, ?2);", &insert_values) {
+                Ok(()) => continue,
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                },
+            }
+        }
+
+        let error = match error {
+            Some(error) => error,
+            None => tx.commit().expect_err("expected quota failure"),
+        };
+
+        assert_eq!(
+            backend_error_from_storage_error(error),
+            storage_traits::indexeddb::BackendError::QuotaExceeded
+        );
     }
 }

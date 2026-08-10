@@ -6203,6 +6203,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ohos-rdb-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70ff47fc564872f081a277e8abec70a5d43464aff82634f210cf28ac63069052"
+dependencies = [
+ "ohos-sys-opaque-types",
+]
+
+[[package]]
 name = "ohos-sys-opaque-types"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9266,6 +9275,7 @@ dependencies = [
  "libc",
  "log",
  "malloc_size_of_derive",
+ "ohos-rdb-sys",
  "postcard",
  "rusqlite",
  "rustc-hash 2.1.3",

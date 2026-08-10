@@ -3,24 +3,37 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 use std::fmt::Debug;
 use std::path::PathBuf;
+#[cfg(feature = "sqlite-backend")]
 use std::str::FromStr;
+#[cfg_attr(not(feature = "sqlite-backend"), allow(unused_imports))]
 use std::{fs, thread};
 
+#[cfg(feature = "sqlite-backend")]
 use log::warn;
+
+#[cfg(ohos_rdb)]
+#[path = "client_storage_ohos_rdb.rs"]
+mod ohos_rdb;
+
+#[cfg(feature = "sqlite-backend")]
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+#[cfg_attr(not(feature = "sqlite-backend"), allow(unused_imports))]
 use servo_base::id::{BrowsingContextId, WebViewId};
 use servo_url::ImmutableOrigin;
+#[cfg_attr(not(feature = "sqlite-backend"), allow(unused_imports))]
 use storage_traits::client_storage::{
     ClientStorageErrorr, ClientStorageThreadHandle, ClientStorageThreadMessage, Mode,
     StorageIdentifier, StorageProxyMap, StorageType,
 };
+#[cfg(feature = "sqlite-backend")]
 use uuid::Uuid;
 
 /// <https://storage.spec.whatwg.org/#storage-quota>
 /// The storage quota of a storage shelf is an implementation-defined conservative estimate of the
 /// total amount of byttes it can hold. We use 10 GiB per shelf, matching Firefox's documented
 /// limit (<https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria>).
+#[cfg(feature = "sqlite-backend")]
 const STORAGE_SHELF_QUOTA_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 trait RegistryEngine {
@@ -52,11 +65,13 @@ trait RegistryEngine {
     fn estimate(&mut self, origin: ImmutableOrigin) -> Result<(u64, u64), String>;
 }
 
+#[cfg(feature = "sqlite-backend")]
 struct SqliteEngine {
     connection: Connection,
     base_dir: PathBuf,
 }
 
+#[cfg(feature = "sqlite-backend")]
 impl SqliteEngine {
     fn new(base_dir: PathBuf) -> rusqlite::Result<Self> {
         let db_path = base_dir.join("reg.sqlite");
@@ -178,6 +193,7 @@ impl SqliteEngine {
     }
 }
 
+#[cfg(feature = "sqlite-backend")]
 fn ensure_storage_shed(
     storage_type: &StorageType,
     browsing_context: Option<String>,
@@ -212,6 +228,7 @@ fn ensure_storage_shed(
 }
 
 /// <https://storage.spec.whatwg.org/#create-a-storage-bucket>
+#[cfg(feature = "sqlite-backend")]
 fn create_a_storage_bucket(
     shelf_id: i64,
     storage_type: StorageType,
@@ -268,6 +285,7 @@ fn create_a_storage_bucket(
 }
 
 /// <https://storage.spec.whatwg.org/#create-a-storage-shelf>
+#[cfg(feature = "sqlite-backend")]
 fn create_a_storage_shelf(
     shed: i64,
     origin: &ImmutableOrigin,
@@ -292,6 +310,7 @@ fn create_a_storage_shelf(
 }
 
 /// <https://storage.spec.whatwg.org/#obtain-a-storage-shelf>
+#[cfg(feature = "sqlite-backend")]
 fn obtain_a_storage_shelf(
     shed: i64,
     origin: &ImmutableOrigin,
@@ -305,6 +324,7 @@ fn obtain_a_storage_shelf(
 ///
 /// A storage shelf exists for each storage key within a storage shed. It holds a bucket map, which
 /// is a map of strings to storage buckets.
+#[cfg(feature = "sqlite-backend")]
 struct StorageShelf {
     default_bucket_id: i64,
 }
@@ -314,6 +334,7 @@ struct StorageShelf {
 /// To obtain a local storage shelf, given an environment settings object environment, return the
 /// result of running obtain a storage shelf with the user agent’s storage shed, environment, and
 /// "local".
+#[cfg(feature = "sqlite-backend")]
 fn obtain_a_local_storage_shelf(
     origin: &ImmutableOrigin,
     tx: &Transaction,
@@ -331,6 +352,7 @@ fn obtain_a_local_storage_shelf(
 ///
 /// A local storage bucket has a mode, which is "best-effort" or "persistent". It is initially
 /// "best-effort".
+#[cfg(feature = "sqlite-backend")]
 fn bucket_mode(bucket_id: i64, tx: &Transaction) -> rusqlite::Result<Mode> {
     let mode: String = tx.query_row(
         "SELECT mode FROM buckets WHERE id = ?1;",
@@ -343,6 +365,7 @@ fn bucket_mode(bucket_id: i64, tx: &Transaction) -> rusqlite::Result<Mode> {
 /// <https://storage.spec.whatwg.org/#dom-storagemanager-persist>
 ///
 /// Set bucket’s mode to "persistent".
+#[cfg(feature = "sqlite-backend")]
 fn set_bucket_mode(bucket_id: i64, mode: Mode, tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE buckets SET mode = ?1, persisted = ?2 WHERE id = ?3;",
@@ -358,6 +381,7 @@ fn set_bucket_mode(bucket_id: i64, mode: Mode, tx: &Transaction) -> rusqlite::Re
 ///
 /// This cannot be an exact amount as user agents might, and are encouraged to, use deduplication,
 /// compression, and other techniques that obscure exactly how much bytes a storage shelf uses.
+#[cfg(feature = "sqlite-backend")]
 fn storage_usage_for_bucket(bucket_id: i64, tx: &Transaction) -> Result<u64, String> {
     let mut stmt = tx
         .prepare(
@@ -391,6 +415,7 @@ fn storage_usage_for_bucket(bucket_id: i64, tx: &Transaction) -> Result<u64, Str
 ///
 /// Directly or indirectly revealing available storage space can lead to fingerprinting and leaking
 /// information outside the scope of the origin involved.
+#[cfg(feature = "sqlite-backend")]
 fn storage_quota_for_bucket(_bucket_id: i64, _tx: &Transaction) -> Result<u64, String> {
     Ok(STORAGE_SHELF_QUOTA_BYTES)
 }
@@ -399,6 +424,7 @@ fn storage_quota_for_bucket(_bucket_id: i64, _tx: &Transaction) -> Result<u64, S
 ///
 /// The storage usage of a storage shelf is an implementation-defined rough estimate of the amount
 /// of bytes used by it.
+#[cfg(feature = "sqlite-backend")]
 fn directory_size(path: &PathBuf) -> Result<u64, String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     if metadata.is_file() {
@@ -417,6 +443,7 @@ fn directory_size(path: &PathBuf) -> Result<u64, String> {
     Ok(size)
 }
 
+#[cfg(feature = "sqlite-backend")]
 impl RegistryEngine for SqliteEngine {
     type Error = rusqlite::Error;
 
@@ -692,15 +719,36 @@ impl ClientStorageThreadFactory for ClientStorageThreadHandle {
             .spawn(move || {
                 // Keep temp_dir alive while the thread runs.
                 let _ = temp_dir;
-                let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
-                    warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
-                    SqliteEngine::memory().unwrap()
-                });
-                ClientStorageThread::new(sender_clone, generic_receiver, engine).start();
+                run_client_storage_thread(sender_clone, generic_receiver, storage_dir);
             })
             .expect("Thread spawning failed");
 
         ClientStorageThreadHandle::new(generic_sender)
+    }
+}
+
+/// Run the client storage thread on whichever backend this build selects. The
+/// thread is generic over the engine, so each backend gets its own
+/// monomorphization and the choice costs one branch at startup.
+fn run_client_storage_thread(
+    sender: GenericSender<ClientStorageThreadMessage>,
+    receiver: GenericReceiver<ClientStorageThreadMessage>,
+    storage_dir: PathBuf,
+) {
+    #[cfg(ohos_rdb)]
+    if crate::shared::use_ohos_rdb_backend() {
+        let engine = ohos_rdb::OhosRdbEngine::new(storage_dir).unwrap();
+        ClientStorageThread::new(sender, receiver, engine).start();
+        return;
+    }
+
+    #[cfg(feature = "sqlite-backend")]
+    {
+        let engine = SqliteEngine::new(storage_dir).unwrap_or_else(|error| {
+            warn!("Failed to initialize ClientStorage engine into storage dir: {error:?}");
+            SqliteEngine::memory().unwrap()
+        });
+        ClientStorageThread::new(sender, receiver, engine).start();
     }
 }
 

@@ -46,6 +46,12 @@ fn shutdown_storage_group(threads: &StorageThreads) {
         .expect("failed to receive web storage exit ack");
 }
 
+// With `config_dir` unset both groups fall back to `tempfile::tempdir()`, which
+// outside an application is `/data/local/tmp`. Opening a second RDB registry
+// from there fails (14800001 / 14800011) about two runs in three. Servo itself
+// is unaffected: it passes the application's cache dir, and both of its
+// configurations open every registry reliably on device.
+#[cfg_attr(ohos_rdb, ignore = "second RDB registry needs an application sandbox")]
 #[test]
 fn test_new_storage_threads_create_independent_groups() {
     let mem_profiler_chan = profile_mem::Profiler::create();

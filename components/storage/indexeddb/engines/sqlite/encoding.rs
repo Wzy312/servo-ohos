@@ -233,6 +233,16 @@ pub fn deserialize(data: &[u8]) -> Option<IndexedDBKeyType> {
     internal_deserialize(data, &mut pos, 0)
 }
 
+// Signature pin: on host builds this file is compiled twice (once as
+// engines::encoding, once as sqlite's submodule); the pin keeps whichever
+// instance goes unused from tripping dead code detection.
+const _: () = {
+    let _ = serialize_number as fn(f64) -> [u8; 8];
+    let _ = deserialize_number as fn(&[u8]) -> Option<f64>;
+    let _ = serialize as fn(&IndexedDBKeyType) -> Vec<u8>;
+    let _ = deserialize as fn(&[u8]) -> Option<IndexedDBKeyType>;
+};
+
 #[cfg(test)]
 mod tests {
     use storage_traits::indexeddb::IndexedDBKeyType;

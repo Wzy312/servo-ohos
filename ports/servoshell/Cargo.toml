@@ -45,7 +45,10 @@ ProductName = "ServoShell"
 default = ["default_without_allocator", "servo-allocator/use-jemalloc"]
 # Feature groups:
 # default features, without a custom allocator.
-default_without_allocator = ["bundled", "default_web_features", "max_log_level", "js_jit"]
+default_without_allocator = ["base", "sqlite-backend"]
+# Everything in the default set except the storage backend, so that a build can
+# pick a different one (`--no-default-features --features "base,ohos-rdb-backend"`).
+base = ["bundled", "default_web_features", "max_log_level", "js_jit"]
 # Default web features should be kept in sync with the list in servo/Cargo.toml.
 # We also need to enable our own features, since we also have `cfg` gated code here.
 default_web_features = ["servo/default_web_features", "gamepad", "webgpu", "webxr"]
@@ -64,7 +67,9 @@ js_jit = ["servo/js_jit"]
 max_log_level = ["log/release_max_level_info"]
 media-gstreamer = ["servo/media-gstreamer"]
 native-bluetooth = ["servo/native-bluetooth"]
+ohos-rdb-backend = ["servo/ohos-rdb-backend"]
 profilemozjs = ["servo/profilemozjs"]
+sqlite-backend = ["servo/sqlite-backend"]
 tracing = ["dep:tracing", "dep:tracing-subscriber", "servo/tracing"]
 tracing-hitrace = ["tracing", "dep:hitrace"]
 tracing-perfetto = ["tracing", "dep:tracing-perfetto"]

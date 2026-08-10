@@ -2,6 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+// Inspects the sqlite registry file directly, so it only applies where sqlite
+// is unambiguously the active backend — with the RDB backend compiled in the
+// choice is a runtime one.
+#![cfg(all(feature = "sqlite-backend", not(ohos_rdb)))]
+
 use std::path::PathBuf;
 
 use rusqlite::Connection;

@@ -5,13 +5,64 @@
 use std::error::Error as StdError;
 
 use libc::ENOSPC;
+#[cfg(feature = "sqlite-backend")]
 use rusqlite::{Error as RusqliteError, ffi};
+
+/// Whether an error, or anything it wraps, reports a full disk.
+pub(crate) fn has_enospc(mut source: Option<&(dyn StdError + 'static)>) -> bool {
+    while let Some(err) = source {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() &&
+            io_err.raw_os_error() == Some(ENOSPC)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// Whether this run should use the OHOS RDB backend. A build with only one
+/// backend compiled in has no choice to make; a build with both makes it once
+/// per store, from the pref, so a single binary can A/B the two.
+#[cfg(ohos_rdb)]
+pub(crate) fn use_ohos_rdb_backend() -> bool {
+    !cfg!(feature = "sqlite-backend") || servo_config::pref!(storage_ohos_rdb_backend_enabled)
+}
+
+/// The error of an engine that can be either backend at runtime.
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+#[derive(Debug)]
+pub(crate) enum TwinError {
+    Sqlite(RusqliteError),
+    Rdb(crate::ohos_rdb::OhosRdbError),
+}
+
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+impl std::fmt::Display for TwinError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TwinError::Sqlite(error) => error.fmt(formatter),
+            TwinError::Rdb(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(all(feature = "sqlite-backend", ohos_rdb))]
+impl StdError for TwinError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            TwinError::Sqlite(error) => error.source(),
+            TwinError::Rdb(error) => error.source(),
+        }
+    }
+}
 
 // These pragmas need to be set once
 pub const DB_INIT_PRAGMAS: [&str; 2] =
     ["PRAGMA journal_mode = WAL;", "PRAGMA encoding = 'UTF-16';"];
 
 // These pragmas need to be set once for in memory databases
+#[cfg(feature = "sqlite-backend")]
 pub const DB_IN_MEMORY_INIT_PRAGMAS: [&str; 1] = ["PRAGMA encoding = 'UTF-16';"];
 
 // These pragmas need to be run once per connection.
@@ -23,21 +74,11 @@ pub const DB_PRAGMAS: [&str; 4] = [
 ];
 
 // These pragmas need to be run once per connection for in memory databases.
+#[cfg(feature = "sqlite-backend")]
 pub const DB_IN_MEMORY_PRAGMAS: [&str; 1] = ["PRAGMA cache_size = 2000;"];
 
+#[cfg(feature = "sqlite-backend")]
 pub(crate) fn is_sqlite_disk_full_error(error: &RusqliteError) -> bool {
-    fn has_enospc(mut source: Option<&(dyn StdError + 'static)>) -> bool {
-        while let Some(err) = source {
-            if let Some(io_err) = err.downcast_ref::<std::io::Error>() &&
-                io_err.raw_os_error() == Some(ENOSPC)
-            {
-                return true;
-            }
-            source = err.source();
-        }
-        false
-    }
-
     // Walk the full chain (including `error` itself).
     let saw_enospc = has_enospc(Some(error as &(dyn StdError + 'static)));
 
